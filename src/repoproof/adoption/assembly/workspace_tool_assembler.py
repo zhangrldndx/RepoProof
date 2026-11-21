@@ -23,7 +23,8 @@ from repoproof.adoption.assembly.tool_assembler import next_tool_task_id
 from repoproof.adoption.delivery import portable_workspace_runtime
 from repoproof.adoption.intake.intent_contract import validate_frozen_intent_projection
 from repoproof.adoption.intake.workspace_fixtures import FixtureBlueprintV1
-from repoproof.domain.models import ToolSpec
+from repoproof.domain.models import ToolSpec, is_workspace_profile
+from repoproof.execution import open_api_replay
 from repoproof.execution.workspace_bundle import (
     build_artifact_manifest,
     identify_input_path,
@@ -140,11 +141,17 @@ _MAIN_MOD = '''from .main import cli
 raise SystemExit(cli())
 '''
 
+# The delivered launcher isolates the tool from the caller's PYTHONPATH.  The
+# one named exception is the Harness's acceptance-time measurement channel
+# (REPOPROOF_EXTRA_PYTHONPATH, absent at delivery): without it the import
+# receipt hook never reached the tool process and the "really used the
+# upstream" gate was judging the workspace's own smoke run instead
+# (incident-receipt-hook-never-reaches-the-tool-process-*).
 _BIN = '''#!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-exec env PYTHONPATH="$ROOT/src" "$ROOT/.venv/bin/python" -m {package} "$@"
-'''
+exec env PYTHONPATH="$ROOT/src${{REPOPROOF_EXTRA_PYTHONPATH:+:$REPOPROOF_EXTRA_PYTHONPATH}}" "$ROOT/.venv/bin/python" -m {package} "$@"
+'''  # noqa: E501 - one shell line; the launcher is copied verbatim
 
 _BUILD = '''#!/usr/bin/env bash
 set -euo pipefail
@@ -183,12 +190,18 @@ publishes a validated directory, and removes partial output on failure.
 Source: {repo_url} @ {commit} (license: {license_id}).
 '''
 
-_TEST_PRELUDE = r'''import hashlib
+_TEST_PRELUDE = r'''import contextlib
+import hashlib
+import importlib.util
 import io
+import json
 import os
 import runpy
+import secrets
+import shutil
 import stat
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -253,34 +266,141 @@ def _golden_sha(root):
     return digest.hexdigest()
 
 
+_JUDGE_RUNNER = (
+    "import json, runpy, sys\n"
+    "from pathlib import Path\n"
+    "ns = runpy.run_path(sys.argv[1])\n"
+    "verify = ns.get('verify')\n"
+    "assert callable(verify), 'frozen semantic verifier has no callable verify'\n"
+    "print(json.dumps(verify(Path(sys.argv[2]), Path(sys.argv[3]))))\n"
+)
+
+
+def _runtime_python():
+    """The delivered tool's own interpreter: the judge imports the same pinned upstream the tool runs on."""
+    root = Path(_TOOL).resolve().parent.parent
+    candidate = root / ".venv" / "bin" / "python"
+    return str(candidate) if candidate.exists() else sys.executable
+
+
 def _semantic_acceptance(source, output):
+    """The frozen judge is the acceptance ruler for authored workspace content.
+
+    It runs in the tool's runtime (its interpreter and src/ on the path), so a
+    verifier that imports the pinned upstream sees exactly what the tool did.
+    """
     verifier_path = Path(__file__).resolve().parent / "semantic_verifier.py"
-    namespace = runpy.run_path(str(verifier_path))
-    verify = namespace.get("verify")
-    assert callable(verify), "frozen semantic verifier has no callable verify"
-    result = verify(source, output)
+    root = Path(_TOOL).resolve().parent.parent
+    env = _tool_env()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(root / "src"), env.get("PYTHONPATH", "")) if part
+    )
+    process = subprocess.run(
+        [_runtime_python(), "-c", _JUDGE_RUNNER, str(verifier_path), str(source), str(output)],
+        capture_output=True, text=True, timeout=300, env=env,
+    )
+    assert process.returncode == 0, "frozen semantic verifier crashed: " + process.stderr[-1200:]
+    lines = [line for line in process.stdout.splitlines() if line.strip()]
+    assert lines, "frozen semantic verifier printed no verdict"
+    result = json.loads(lines[-1])
     assert isinstance(result, dict), "semantic verifier returned a non-object"
     reasons = result.get("reason_codes") or []
-    assert result.get("ok") is True, "semantic verifier rejected artifact: " + ",".join(
-        str(item) for item in reasons
+    details = result.get("reason_details") or {}
+    assert result.get("ok") is True, "semantic verifier rejected artifact: " + "; ".join(
+        f"{item}: {details.get(item, '')}".rstrip(": ") for item in reasons
     )
+
+
+_OPEN_API_HOSTS = ()  # rewritten per task by the assembler
+
+
+def _replay_module():
+    """The Harness replay stub shipped beside this test (standard library only)."""
+    path = Path(__file__).resolve().parent / "_open_api_replay.py"
+    spec = importlib.util.spec_from_file_location("_open_api_replay", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _run_case(tmp_path, example_id, *, exact=True):
     source = _FIXTURES / example_id / "input"
     expected = _FIXTURES / example_id / "expected"
     output = tmp_path / f"{example_id}-output"
-    process = subprocess.run(
-        [_TOOL, str(source), "--out-dir", str(output)],
-        capture_output=True, text=True, timeout=120, env=_tool_env(),
-    )
+    responses = source / "__responses__"
+    env = _tool_env()
+    with contextlib.ExitStack() as stack:
+        tool_input = source
+        server = None
+        if responses.is_dir():
+            # Open-API tool: serve the frozen recordings from loopback, hide the
+            # recordings from the tool, and judge the run by the stub's ledger.
+            replay = _replay_module()
+            canary = secrets.token_hex(16)
+            server = stack.enter_context(replay.ReplayServer(responses, canary=canary))
+            hosts = sorted({*_OPEN_API_HOSTS, *(key[1] for key in replay.load_manifest(responses))})
+            tool_input = tmp_path / f"{example_id}-input"
+            shutil.copytree(source, tool_input, ignore=shutil.ignore_patterns("__responses__"))
+            env.update(replay.base_urls_env(server, hosts))
+            env[replay.CANARY_ENV] = canary
+        process = subprocess.run(
+            [_TOOL, str(tool_input), "--out-dir", str(output)],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        if server is not None:
+            unrecorded = server.unrecorded()
+            assert not unrecorded, (
+                "tool requested outside the recording: " + json.dumps(unrecorded[:3])
+            )
+            leaks = server.canary_leaks()
+            assert not leaks, (
+                "tool sent the canary credential in a request: " + json.dumps(leaks[:3])
+            )
+            assert server.ledger, "tool never called the open API stub"
+            if output.is_dir():
+                for path in sorted(output.rglob("*")):
+                    if path.is_file() and canary.encode() in path.read_bytes():
+                        raise AssertionError(
+                            "canary credential leaked into artifact "
+                            + path.relative_to(output).as_posix()
+                        )
     assert process.returncode == 0, process.stderr
     assert output.is_dir()
     if exact:
-        assert _golden_sha(output) == _golden_sha(expected)
+        assert _golden_sha(output) == _golden_sha(expected), _golden_mismatch(output, expected)
     else:
         _semantic_acceptance(source, output)
     return output
+
+
+def _golden_tree(root):
+    rows = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        rows[path.relative_to(root).as_posix()] = (
+            _golden_file_identity(path.read_bytes()),
+            bool(stat.S_IMODE(info.st_mode) & 0o111),
+        )
+    return rows
+
+
+def _golden_mismatch(output, expected):
+    """Say which files differ: a bare pair of digests locates nothing."""
+    ours, theirs = _golden_tree(output), _golden_tree(expected)
+    extra = sorted(set(ours) - set(theirs))[:6]
+    missing = sorted(set(theirs) - set(ours))[:6]
+    differing = [
+        f"{name}{' (exec bit)' if ours[name][0] == theirs[name][0] else ''}"
+        for name in sorted(set(ours) & set(theirs))
+        if ours[name] != theirs[name]
+    ][:6]
+    return (
+        "golden mismatch: only-in-output=" + json.dumps(extra)
+        + " only-in-expected=" + json.dumps(missing)
+        + " differing=" + json.dumps(differing)
+    )
 '''
 
 
@@ -289,32 +409,46 @@ def _test_source(
     *,
     held: bool,
     smoke_command: tuple[str, ...] = (),
+    open_api_hosts: tuple[str, ...] = (),
 ) -> str:
-    body = [_TEST_PRELUDE]
+    body = [
+        _TEST_PRELUDE.replace(
+            "_OPEN_API_HOSTS = ()", f"_OPEN_API_HOSTS = {tuple(open_api_hosts)!r}"
+        )
+    ]
     prefix = "held_example" if held else "example"
     for index, example in enumerate(examples, start=1):
-        exact_argument = ", exact=False" if held else ""
+        # A workspace is authored content (pages, application files, data
+        # layouts the implementer chose), so an independent implementation can
+        # never match the reference byte for byte; the frozen judge — the
+        # ruler the self-check proved discriminative — is the acceptance for
+        # public and held examples alike.  Byte identity survives only where
+        # it is satisfiable: the same implementation run twice
+        # (incident-workspace-acceptance-demands-reference-bytes-*).
         body.append(
             f"\ndef test_{prefix}_{index}(tmp_path):\n"
-            f"    _run_case(tmp_path, {example.example_id!r}{exact_argument})\n"
+            f"    _run_case(tmp_path, {example.example_id!r}, exact=False)\n"
         )
     if not held and examples:
         identifier = examples[0].example_id
         body.append(
             "\ndef test_workspace_output_is_deterministic(tmp_path):\n"
-            f"    first = _run_case(tmp_path / 'one', {identifier!r})\n"
-            f"    second = _run_case(tmp_path / 'two', {identifier!r})\n"
+            # Judge-accepted both times; identity is asked only of the two
+            # runs of the same implementation, never of the reference tree
+            # (incident-workspace-acceptance-demands-reference-bytes-*).
+            f"    first = _run_case(tmp_path / 'one', {identifier!r}, exact=False)\n"
+            f"    second = _run_case(tmp_path / 'two', {identifier!r}, exact=False)\n"
             # Determinism is judged by the same golden identity as acceptance:
             # zip writer incidentals (member DOS timestamps, ordering, compression)
             # are not content (incident-artifact-identity-zip-metadata-*).
-            "    assert _golden_sha(first) == _golden_sha(second)\n"
+            "    assert _golden_sha(first) == _golden_sha(second), _golden_mismatch(first, second)\n"
         )
         if smoke_command:
             entrypoint = smoke_command[0].removeprefix("./")
             arguments = list(smoke_command[1:])
             body.append(
                 "\ndef test_workspace_runtime_smoke(tmp_path):\n"
-                f"    workspace = _run_case(tmp_path, {identifier!r})\n"
+                f"    workspace = _run_case(tmp_path, {identifier!r}, exact=False)\n"
                 f"    argv = [str(workspace / {entrypoint!r}), *{arguments!r}]\n"
                 "    process = subprocess.run(\n"
                 "        argv, cwd=workspace, stdin=subprocess.DEVNULL,\n"
@@ -325,24 +459,37 @@ def _test_source(
     return "".join(body)
 
 
-def _interface_test_source(first_example_id: str) -> str:
+def _interface_test_source(
+    first_example_id: str, open_api_hosts: tuple[str, ...] = ()
+) -> str:
+    # Interface tests never reach a real host: an open-API tool sees every
+    # declared host mapped to a closed loopback port, so a tool that fetches
+    # before validating its arguments fails here instead of leaking a request.
+    dead_ports = (
+        "_ENV[\"REPOPROOF_OPEN_API_BASE_URLS\"] = "
+        + repr(json.dumps({host: f"http://127.0.0.1:9/{host}" for host in open_api_hosts}))
+        if open_api_hosts
+        else ""
+    )
     return f'''import os
 import subprocess
 from pathlib import Path
 
 _TOOL = os.environ["REPOPROOF_TOOL_BIN"]
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_ENV = dict(os.environ)
+{dead_ports}
 
 
 def test_help_reachable():
-    result = subprocess.run([_TOOL, "--help"], capture_output=True, text=True)
+    result = subprocess.run([_TOOL, "--help"], capture_output=True, text=True, env=_ENV)
     assert result.returncode == 0 and "usage" in result.stdout.lower()
 
 
 def test_missing_input_is_user_error(tmp_path):
     result = subprocess.run(
         [_TOOL, str(tmp_path / "missing"), "--out-dir", str(tmp_path / "out")],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_ENV,
     )
     assert result.returncode == 1 and result.stderr and not result.stdout
 
@@ -352,11 +499,28 @@ def test_existing_output_is_not_overwritten(tmp_path):
     marker = output / "marker"; marker.write_text("keep")
     result = subprocess.run(
         [_TOOL, str(_FIXTURES / {first_example_id!r} / "input"),
-         "--out-dir", str(output)], capture_output=True, text=True,
+         "--out-dir", str(output)], capture_output=True, text=True, env=_ENV,
     )
     assert result.returncode == 1
     assert marker.read_text() == "keep"
 '''
+
+
+def _open_api_support_files(
+    task_id: str, skeleton_rel: str, open_api_hosts: tuple[str, ...]
+) -> dict[str, str]:
+    """Ship the Harness replay stub beside every acceptance test of an open-API tool.
+
+    The frozen tests start the stub themselves (the Agent session has no Core
+    import path), so the module travels with them, standard library only.
+    """
+    if not open_api_hosts:
+        return {}
+    source = Path(str(open_api_replay.__file__)).read_text(encoding="utf-8")
+    return {
+        f"oracle/{task_id}/_open_api_replay.py": source,
+        f"{skeleton_rel}/public_tests/_open_api_replay.py": source,
+    }
 
 
 def _embedded_control(
@@ -466,7 +630,7 @@ def assemble_workspace_tool_task(
     """Freeze a v4 workspace task without running a model."""
 
     root = Path(root)
-    if tool.schema_version != 4 or tool.delivery_profile_id != "workspace_bundle_v1":
+    if tool.schema_version != 4 or not is_workspace_profile(tool.delivery_profile_id):
         raise CompileError("workspace assembler requires ToolSpec v4")
     if tool.workspace_contract is None:
         raise CompileError("workspace contract is required")
@@ -669,6 +833,7 @@ def assemble_workspace_tool_task(
     }
 
     contract_json = workspace_contract.model_dump(mode="json")
+    open_api_hosts = tuple(workspace_contract.open_api_hosts)
     portable_source = Path(str(portable_workspace_runtime.__file__)).read_text(
         encoding="utf-8"
     )
@@ -684,11 +849,16 @@ def assemble_workspace_tool_task(
             "distribution": distribution,
         },
         "contract_schema_version": 4,
-        "delivery_profile_id": "workspace_bundle_v1",
+        "delivery_profile_id": tool.delivery_profile_id,
         "workspace_contract": contract_json,
         "interface": tool.interface.model_dump(mode="json"),
         "capability": {"output_schema": output_schema},
-        "runtime": {"python": "3.12", "cpu_only": True, "offline": True},
+        "runtime": {
+            "python": "3.12",
+            "cpu_only": True,
+            "offline": not open_api_hosts,
+            "open_api_hosts": list(open_api_hosts),
+        },
         "verification": None,
     }
     files: dict[str, str] = {
@@ -734,10 +904,15 @@ def assemble_workspace_tool_task(
             public,
             held=False,
             smoke_command=workspace_contract.smoke_command,
+            open_api_hosts=open_api_hosts,
         ),
         f"{skeleton_rel}/public_tests/test_interface_contract.py": (
-            _interface_test_source(public[0].example_id)
+            _interface_test_source(public[0].example_id, open_api_hosts)
         ),
+        # The frozen judge is the public acceptance ruler too, so it ships
+        # beside the public tests (the agent may read the contract's executable
+        # form; the held examples and the fresh audit keep the inputs private).
+        f"{skeleton_rel}/public_tests/semantic_verifier.py": semantic_verifier_source,
         f"oracle/{task_id}/test_capability.py": "",
         f"oracle/{task_id}/semantic_verifier.py": semantic_verifier_source,
         f"oracle/{task_id}/fixture_builder.py": fixture_builder_source,
@@ -769,8 +944,10 @@ def assemble_workspace_tool_task(
         public,
         held=False,
         smoke_command=workspace_contract.smoke_command,
+        open_api_hosts=open_api_hosts,
     )
-    held_source = _test_source(held, held=True)
+    held_source = _test_source(held, held=True, open_api_hosts=open_api_hosts)
+    files.update(_open_api_support_files(task_id, skeleton_rel, open_api_hosts))
     held_functions = held_source[held_source.index("def test_held_example_"):]
     files[f"oracle/{task_id}/test_capability.py"] = oracle_source + "\n" + held_functions
     example_docs = {
@@ -829,7 +1006,7 @@ def assemble_workspace_tool_task(
         "files": sorted(files),
         "public": len(public),
         "held": len(held),
-        "delivery_profile_id": "workspace_bundle_v1",
+        "delivery_profile_id": tool.delivery_profile_id,
         "next": (
             ".venv/bin/python -m repoproof.cli freeze-task "
             f"--contract contracts/{task_id}.yaml --full"

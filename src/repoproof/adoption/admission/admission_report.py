@@ -18,12 +18,17 @@ READY = "READY"
 NEED_INFORMATION = "NEED_INFORMATION"
 UNSUPPORTED = "UNSUPPORTED"
 RISK_REVIEW = "RISK_REVIEW"
+# A boundary the user can step around: the request as phrased is outside the
+# support surface, and the report carries a rewritten request that provably
+# is inside it.  Accepting is the user's call, never the system's.
+NEED_REFRAME = "NEED_REFRAME"
 
 _NEXT_STEP = {
     READY: "可以进入采用计划(Plan)阶段;开始前你仍需确认成功标准。",
     NEED_INFORMATION: "补齐下方「?」条目后重新检查;系统不会替你猜。",
     UNSUPPORTED: "更换目标仓库,或等待后续版本支持;下方「×」是硬性原因。",
     RISK_REVIEW: "逐条阅读「!」风险并确认接受后,才能进入采用计划。",
+    NEED_REFRAME: "需求碰到了支持面边界;下方「?」是系统建议的改写。接受则按改写后的题面重新提交,或自行调整需求。",
 }
 
 
@@ -36,6 +41,8 @@ class AdmissionReport(BaseModel):
     reason_codes: list[str] = []       # stable public machine reasons
     next_step: str = ""
     executes_third_party_code: bool = True
+    # Only with status NEED_REFRAME: the rewritten request the user may accept.
+    reframed_capability: str | None = None
 
     def to_dict(self) -> dict:
         return self.model_dump()
@@ -123,6 +130,17 @@ def decide_tool_intent(capability_goal: str) -> AdmissionReport | None:
     risk = classify_product_intent_risk(capability_goal)
     if risk.supported:
         return None
+    if risk.reframable and risk.reframed_capability:
+        # Not a rejection: the boundary is named, the supported rewrite is
+        # offered, and nothing runs until the user says which one they want.
+        return AdmissionReport(
+            status=NEED_REFRAME,
+            questions=list(risk.reframes),
+            reason_codes=list(risk.reason_codes),
+            reframed_capability=risk.reframed_capability,
+            next_step=_NEXT_STEP[NEED_REFRAME],
+            executes_third_party_code=False,
+        )
     return AdmissionReport(
         status=UNSUPPORTED,
         blockers=list(risk.blockers),

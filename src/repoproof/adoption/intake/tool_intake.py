@@ -108,7 +108,34 @@ def extract_distribution(repo_dir: Path) -> tuple[str, str]:
                 if mt:
                     return mt.group(1), f"{cand.relative_to(repo_dir)} __title__ 字面量"
         return "", "setup.py 存在但 name 非静态字面量(不执行代码,放弃推导)"
-    return "", "无 pyproject [project].name / setup.cfg / setup.py name"
+    # A polyglot monorepo keeps its Python package, with its own pyproject, in
+    # a first-level subdirectory (python/, bindings/…) and no Python metadata
+    # at the root.  The version and import-module inference already know that
+    # layout but both take the distribution as given; without this step the
+    # whole chain never engaged (incident-distribution-not-inferred-in-monorepo-*).
+    # One candidate is evidence; several are a question for the user, named.
+    candidates: list[tuple[str, str]] = []
+    if repo_dir.is_dir():
+        for child in sorted(repo_dir.iterdir()):
+            sub = child / "pyproject.toml"
+            if child.name.startswith((".", "_")) or child.is_symlink() or not child.is_dir() or not sub.is_file():
+                continue
+            try:
+                data = tomllib.loads(sub.read_text(encoding="utf-8"))
+            except (tomllib.TOMLDecodeError, OSError):
+                continue
+            project_name = (data.get("project") or {}).get("name")
+            poetry_name = ((data.get("tool") or {}).get("poetry") or {}).get("name")
+            name = project_name if isinstance(project_name, str) else poetry_name
+            if isinstance(name, str) and name.strip():
+                candidates.append((name.strip(), child.name))
+    if len(candidates) == 1:
+        name, sub_dir = candidates[0]
+        return name, f"子目录 {sub_dir}/pyproject.toml [project].name(根目录无 Python 元数据)"
+    if candidates:
+        listed = ", ".join(f"{sub_dir}/ ({name})" for name, sub_dir in candidates)
+        return "", f"根目录无 Python 元数据,且多个子目录各带 pyproject,不猜:{listed}"
+    return "", "无 pyproject [project].name / setup.cfg / setup.py name(根目录与一级子目录均无)"
 
 
 def extract_import_module(repo_dir: Path, distribution: str) -> tuple[str, str]:
@@ -130,14 +157,54 @@ def extract_import_module(repo_dir: Path, distribution: str) -> tuple[str, str]:
                      and (e / "__init__.py").is_file()), "")
         if real:
             return real, f"{label}:{real}/__init__.py 存在(真实目录名回读)"
+    from repoproof.adoption.analysis.repository_analyzer import _NON_RUNTIME_ZONES
+
+    # scripts/ and test/ carry __init__.py in many repositories; they are
+    # tooling beside the package, never the package
+    # (incident-import-module-unresolved-reaches-evidence-validator-*).
+    non_runtime = set(_NON_RUNTIME_ZONES) | {"scripts", "tools", "benchmarks", "ci", "contrib", "bin"}
+    ambiguous: list[str] = []
     for base, label in ((repo_dir / "src", "src 布局"), (repo_dir, "顶层布局")):
         if not base.is_dir():
             continue
-        pkgs = [p.name for p in base.iterdir()
-                if p.is_dir() and (p / "__init__.py").is_file()
-                and not p.name.startswith((".", "_")) and p.name != "tests"]
+        pkgs = sorted(p.name for p in base.iterdir()
+                      if p.is_dir() and (p / "__init__.py").is_file()
+                      and not p.name.startswith((".", "_")) and p.name.lower() not in non_runtime)
         if len(pkgs) == 1:
             return pkgs[0], f"{label}:唯一顶层包 {pkgs[0]}/"
+        if len(pkgs) > 1:
+            ambiguous.append(f"{label}:{', '.join(name + '/' for name in pkgs)}")
+    # Neither root nor src/: honour pyproject's declared package location, then
+    # any one-level subdirectory that holds the package (lib/<pkg>, python/<pkg>)
+    # (incident-import-module-not-inferred-lib-layout-*).
+    bases: list[tuple[Path, str]] = []
+    pyproject = repo_dir / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            import tomllib
+
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        package_dir = ((data.get("tool") or {}).get("setuptools") or {}).get("package-dir") or {}
+        if isinstance(package_dir, dict):
+            for value in package_dir.values():
+                if isinstance(value, str) and value.strip():
+                    bases.append((repo_dir / value.strip(), f"pyproject package-dir {value.strip()}/"))
+    if repo_dir.is_dir():
+        for child in sorted(repo_dir.iterdir()):
+            if child.is_dir() and not child.is_symlink() and not child.name.startswith((".", "_")):
+                bases.append((child, f"子目录 {child.name}/"))
+    for base, label in bases:
+        if not cand or not base.is_dir():
+            continue
+        real = next((e.name for e in sorted(base.iterdir())
+                     if e.is_dir() and e.name.lower() == cand.lower()
+                     and (e / "__init__.py").is_file()), "")
+        if real:
+            return real, f"{label}:{real}/__init__.py 存在(真实目录名回读)"
+    if ambiguous:
+        return "", "无法定位唯一可导入包:候选 " + "; ".join(ambiguous)
     return "", "无法定位唯一可导入包"
 
 

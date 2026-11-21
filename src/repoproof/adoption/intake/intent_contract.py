@@ -30,6 +30,7 @@ from repoproof.adoption.delivery.product_profile import (
     ProductProfileError,
     product_delivery_profile,
 )
+from repoproof.domain.models import is_workspace_profile
 
 INTENT_CONTRACT_SCHEMA_VERSION = 1
 _COMMITMENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
@@ -341,7 +342,7 @@ def install_delivery_intent_from_interface(
         "outputs": [{
             "kind": (
                 "directory"
-                if profile.profile_id == "workspace_bundle_v1"
+                if is_workspace_profile(profile.profile_id)
                 else "text_artifact"
             ),
             "format_id": artifact.format_id,

@@ -31,7 +31,7 @@ from repoproof.adoption.delivery.product_profile import (
     product_delivery_profile,
 )
 from repoproof.adoption.intake.intent_contract import IntentContractDraftV1
-from repoproof.domain.models import ToolOutputContract, ToolSpec
+from repoproof.domain.models import ToolOutputContract, ToolSpec, is_workspace_profile
 from repoproof.runner import tool_registry
 from repoproof.runner.tool_paths import ToolPathError
 from repoproof.runner.tool_release import (
@@ -276,7 +276,7 @@ def validate_draft_output_examples(draft_dir: Path) -> dict[str, Any]:
         )
 
         workspace_contract = spec.workspace_contract
-        if spec.delivery_profile_id != "workspace_bundle_v1" or workspace_contract is None:
+        if not is_workspace_profile(spec.delivery_profile_id) or workspace_contract is None:
             errors.append("WORKSPACE_CONTRACT_MISSING: v4 必须声明 workspace_bundle_v1 目录合同")
         try:
             examples_doc = yaml.safe_load((draft_dir / "workspace_examples.yaml").read_text(encoding="utf-8"))

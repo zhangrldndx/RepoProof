@@ -52,9 +52,62 @@ _LICENSE_KEYWORDS = [
     ("MIT", "Permission is hereby granted, free of charge"),
     ("Apache-2.0", "Apache License"), ("BSD", "BSD"),
     ("BSD", "Redistribution and use in source and binary forms"),
+    # LGPL before GPL: its title contains the GPL title's words.
+    ("LGPL", "GNU LESSER GENERAL PUBLIC LICENSE"),
     ("GPL-3.0", "GNU GENERAL PUBLIC LICENSE"), ("MPL-2.0", "Mozilla Public License"),
+    ("ISC", "ISC License"), ("PSF-2.0", "Python Software Foundation License"),
     ("Unlicense", "unlicense"),
 ]
+_LICENSE_FILE_STEMS = ("license", "licence", "copying")
+_LICENSE_VERSION_RE = re.compile(r"Version\s+(\d(?:\.\d)?)", re.IGNORECASE)
+_CLASSIFIER_RE = re.compile(r"License :: OSI Approved :: ([^\"'\n]+)")
+
+
+def detect_license(root: Path) -> tuple[str, str]:
+    """(license label, where it was read) from the file, then pyproject, then setup.py; ("", "") when unknown.
+
+    LICENSE.rst, an LGPL text and a PEP 639 ``license = "..."`` string all
+    went unread and ended journeys on a confirmation nobody could give
+    (incident-license-not-identified-*).
+    """
+
+    root = Path(root)
+    lic_file = next(
+        (p for p in sorted(root.iterdir()) if p.is_file() and p.name.lower().split(".")[0] in _LICENSE_FILE_STEMS),
+        None,
+    ) if root.is_dir() else None
+    if lic_file is not None:
+        head_text = (_read_text(lic_file) or "")[:2000]
+        lowered = head_text.lower()
+        spdx = next((s for s, kw in _LICENSE_KEYWORDS if kw.lower() in lowered), None)
+        if spdx in {"LGPL", "GPL-3.0"}:
+            match = _LICENSE_VERSION_RE.search(head_text)
+            version = match.group(1) if match else ("3" if spdx == "GPL-3.0" else "")
+            family = "LGPL" if spdx == "LGPL" else "GPL"
+            spdx = f"{family}-{version if '.' in version else version + '.0'}" if version else family
+        if spdx:
+            return spdx, lic_file.name
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        project = data.get("project") or {}
+        lic = project.get("license")
+        text = lic if isinstance(lic, str) else (lic.get("text") if isinstance(lic, dict) else None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()[:80], "pyproject.toml [project].license"
+        for item in project.get("classifiers") or []:
+            match = _CLASSIFIER_RE.search(str(item))
+            if match:
+                return match.group(1).strip()[:80], "pyproject.toml classifier"
+    setup_py = root / "setup.py"
+    if setup_py.is_file():
+        match = _CLASSIFIER_RE.search(_read_text(setup_py) or "")
+        if match:
+            return match.group(1).strip()[:80], "setup.py classifier"
+    return "", ""
 
 
 class CapabilityCandidate(BaseModel):
@@ -291,6 +344,26 @@ def _module_secret_env_reads(tree: ast.Module) -> tuple[set[str], set[str]]:
     return required, optional
 
 
+def _runtime_package_roots(root: Path) -> set[tuple[str, ...]]:
+    """Path prefixes of importable packages: ('pkg',) or ('src', 'pkg')."""
+
+    roots: set[tuple[str, ...]] = set()
+    for base, prefix in ((root, ()), (root / "src", ("src",))):
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
+            name = child.name
+            if (
+                child.is_dir()
+                and not child.is_symlink()
+                and (child / "__init__.py").is_file()
+                and not name.startswith((".", "_"))
+                and name not in _NON_RUNTIME_ZONES
+            ):
+                roots.add((*prefix, name))
+    return roots
+
+
 def _scan_secret_env_reads(
     root: Path,
 ) -> tuple[dict[str, Finding], dict[str, Finding], dict[str, Finding], int]:
@@ -308,6 +381,12 @@ def _scan_secret_env_reads(
     optional: dict[str, Finding] = {}
     non_runtime: dict[str, Finding] = {}
     parse_failed = 0
+    # Runtime is the importable package (pkg/ or src/pkg/).  Repository tooling
+    # beside it — release scripts, contributor pages, benchmarks — reads
+    # credentials the delivered capability never needs
+    # (incident-secret-scan-condemns-repo-tooling-*).  When no package can be
+    # identified, every file keeps counting as before.
+    package_roots = _runtime_package_roots(root)
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
         parts = rel.parts
@@ -323,7 +402,10 @@ def _scan_secret_env_reads(
             continue
         module_required, module_optional = _module_secret_env_reads(tree)
         rel_s = str(rel)
-        if any(part in _NON_RUNTIME_ZONES for part in parts[:-1]):
+        outside_package = bool(package_roots) and not any(
+            parts[: len(prefix)] == prefix for prefix in package_roots
+        )
+        if outside_package or any(part in _NON_RUNTIME_ZONES for part in parts[:-1]):
             for name in module_required | module_optional:
                 non_runtime.setdefault(name, Finding.fact(name, rel_s))
             continue
@@ -394,15 +476,18 @@ def analyze_repository_dir(
 
     # ---- 2. license ----
     license_finding = Finding.unknown("no LICENSE file or pyproject license field")
-    lic_file = next((p for p in (root / n for n in
-                     ("LICENSE", "LICENSE.txt", "LICENSE.md", "LICENCE", "COPYING")) if p.exists()), None)
-    if lic_file:
+    detected, detected_from = detect_license(root)
+    lic_file = next(
+        (p for p in sorted(root.iterdir()) if p.is_file() and p.name.lower().split(".")[0] in _LICENSE_FILE_STEMS),
+        None,
+    )
+    if detected:
+        sources.append(detected_from.split(" ")[0])
+        license_finding = Finding.fact(detected, detected_from)
+    elif lic_file:
         sources.append(lic_file.name)
-        head_text = (_read_text(lic_file) or "")[:2000]
-        spdx = next((s for s, kw in _LICENSE_KEYWORDS if kw.lower() in head_text.lower()), None)
-        license_finding = Finding.fact(spdx or "存在但未识别类型", lic_file.name)
-        if spdx is None:
-            risks.append("LICENSE 文件存在但类型未识别——需人工确认许可证兼容性")
+        license_finding = Finding.fact("存在但未识别类型", lic_file.name)
+        risks.append("LICENSE 文件存在但类型未识别——需人工确认许可证兼容性")
     elif lic:
         val = lic if isinstance(lic, str) else (lic.get("text") or lic.get("file") or str(lic))
         license_finding = Finding.fact(val, "pyproject.toml [project.license]")

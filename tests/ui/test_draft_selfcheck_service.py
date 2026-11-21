@@ -196,7 +196,7 @@ class _ScriptedDrafter:
 def _scripted_candidates(monkeypatch, outcomes: list[dict]):
     calls: list[int] = []
 
-    def fake(draft_dir, *, n, offline):
+    def fake(draft_dir, *, n, offline, **_kw):
         if offline is False:
             # The fresh-input agreement probe (one online proposal) runs before the
             # drafted generation; these scripts describe the drafted generation only.

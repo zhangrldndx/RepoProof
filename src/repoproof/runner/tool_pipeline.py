@@ -41,6 +41,8 @@ from repoproof.adoption.intake.upstream_pin import (
     normalize_dist_name,
     upstream_version,
 )
+from repoproof.domain.models import is_workspace_profile
+from repoproof.runner.open_api_rehearsal import live_probe
 from repoproof.runner.tool_export import (
     ToolExportError,
     install_verified_tool,
@@ -122,6 +124,44 @@ def _install_error_projection(exc: BaseException) -> tuple[str, str]:
         "TOOL_INSTALL_PREFLIGHT_FAILED",
         "检查目标工具目录、registry、package identity 与 release ledger 后重试；本次不得进入 Agent repair。",
     )
+
+
+def rehearsal_after_positive_control(
+    *, stages: dict, task_id: str, project_root: Path, rehearsal_report: dict
+) -> dict:
+    """Project the positive control, then ask today's real hosts before any model budget.
+
+    The zero-model rehearsal proves the frozen task against its recordings.  For
+    an open-API task that is not the whole question: the live probe asks whether
+    the declared hosts still answer the recorded requests the way the recording
+    assumed.  A boundary (credentials now required, endpoint gone, shape
+    drifted, unreachable) ends the journey here with a downgrade proposal
+    instead of letting an Agent repair against a world that changed.
+    """
+
+    stages["rehearsal"] = _rehearsal_stage(rehearsal_report)
+    verdict = rehearsal_report.get("verdict")
+    if verdict != "PASS_ADAPTED":
+        return {"task_id": task_id, "stages": stages, "verdict": f"REHEARSAL_{verdict}", "exported": None}
+    try:
+        probe = live_probe(
+            project_root=Path(project_root),
+            task_id=task_id,
+            out_root=Path(project_root) / "runs" / "rehearsal-live",
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken probe must neither pass silently nor crash the pipeline
+        probe = {
+            "status": "PROBE_ERROR",
+            "reason_codes": ["LIVE_PROBE_ERROR"],
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+    if probe.get("status") != "NOT_APPLICABLE":
+        stages["live_probe"] = probe
+    if probe.get("status") == "LIVE_BOUNDARY":
+        return {"task_id": task_id, "stages": stages, "verdict": "REHEARSAL_LIVE_BOUNDARY", "exported": None}
+    if probe.get("status") == "PROBE_ERROR":
+        return {"task_id": task_id, "stages": stages, "verdict": "REHEARSAL_LIVE_PROBE_ERROR", "exported": None}
+    return {"task_id": task_id, "stages": stages, "verdict": "REHEARSAL_PASS_ONLY", "exported": None}
 
 
 def tool_build_completed(result: dict, *, rehearsal_only: bool) -> bool:
@@ -284,7 +324,7 @@ def _stage_workspace_wheelhouse(
     """
     tool_doc = yaml.safe_load(Path(tool_contract_path).read_text(encoding="utf-8")) or {}
     tool = tool_doc.get("tool") or {}
-    if tool.get("delivery_profile_id") != "workspace_bundle_v1":
+    if not is_workspace_profile(tool.get("delivery_profile_id")):
         return None
     host_doc = yaml.safe_load(Path(host_contract_path).read_text(encoding="utf-8")) or {}
     host_copy = Path(str((host_doc.get("host") or {}).get("copy_path") or ""))
@@ -463,7 +503,7 @@ def _record_workspace_repair_incidents(
 
     contract_path = Path(project_root) / "contracts" / f"{task_id}.yaml"
     document = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
-    if ((document.get("tool") or {}).get("delivery_profile_id")) != "workspace_bundle_v1":
+    if not is_workspace_profile((document.get("tool") or {}).get("delivery_profile_id")):
         return []
     if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
         raise PipelineError("workspace run did not publish a safe run_id for incidents")
@@ -565,7 +605,9 @@ def _record_workspace_repair_incidents(
             incident_id=f"incident-{identity}",
             framework_git_commit=commit,
             framework_tree_sha256=framework_tree,
-            profile_id="workspace_bundle_v1",
+            profile_id=str(
+                (document.get("tool") or {}).get("delivery_profile_id") or "workspace_bundle_v1"
+            ),
             task_version=task_id,
             stage="AGENT_ADAPTER",
             owner=owner,
@@ -736,10 +778,7 @@ def tool_build_real_from_frozen(
         ) or {}
     except (OSError, TypeError, yaml.YAMLError) as exc:
         raise PipelineError(f"无法读取冻结宿主合同的 wheelhouse：{exc}") from exc
-    if (
-        ((tool_doc_for_profile.get("tool") or {}).get("delivery_profile_id"))
-        == "workspace_bundle_v1"
-    ):
+    if is_workspace_profile((tool_doc_for_profile.get("tool") or {}).get("delivery_profile_id")):
         _prepare_harness_test_toolchain(project_root)
     preflight = run_product_preflight(
         project_root=project_root,
@@ -784,14 +823,9 @@ def tool_build_real_from_frozen(
                 },
             ) from exc
         rp = fake.get("report") or {}
-        stages["rehearsal"] = _rehearsal_stage(rp)
-        verdict = "REHEARSAL_PASS_ONLY" if rp.get("verdict") == "PASS_ADAPTED" else f"REHEARSAL_{rp.get('verdict')}"
-        return {
-            "task_id": task_id,
-            "stages": stages,
-            "verdict": verdict,
-            "exported": None,
-        }
+        return rehearsal_after_positive_control(
+            stages=stages, task_id=task_id, project_root=project_root, rehearsal_report=rp
+        )
 
     try:
         real = run_host_guided_cli(
@@ -1009,7 +1043,7 @@ def tool_build(
         route = plan_obj.implementation_route
         if (
             isinstance(draft, dict)
-            and ((draft.get("tool") or {}).get("delivery_profile_id")) == "workspace_bundle_v1"
+            and is_workspace_profile((draft.get("tool") or {}).get("delivery_profile_id"))
             and route != "AGENT_ADAPT"
         ):
             raise PipelineError("workspace composition must use the frozen AGENT_ADAPT route")
@@ -1070,7 +1104,7 @@ def tool_build(
             raise PipelineError("冻结合同与预物化草稿身份不一致；拒绝续跑或重写旧版本")
         example_file = (
             draft_dir / "workspace_examples.yaml"
-            if ((draft.get("tool") or {}).get("delivery_profile_id")) == "workspace_bundle_v1"
+            if is_workspace_profile((draft.get("tool") or {}).get("delivery_profile_id"))
             else draft_dir / "examples.yaml"
         )
         examples_doc = yaml.safe_load(example_file.read_text(encoding="utf-8")) or {}
@@ -1280,10 +1314,7 @@ def tool_build(
                 encoding="utf-8"
             )
         ) or {}
-        if (
-            ((tool_profile_document.get("tool") or {}).get("delivery_profile_id"))
-            == "workspace_bundle_v1"
-        ):
+        if is_workspace_profile((tool_profile_document.get("tool") or {}).get("delivery_profile_id")):
             harness_toolchain = _prepare_harness_test_toolchain(project_root)
     # 事后核账只在**真备轮**时成立:`wheelhouse_cmd` 是测试注入口(E2E 用
     # `true` 跳过下载、改由 PYTHONPATH shim 提供上游),那种情况下这里没有
@@ -1410,12 +1441,11 @@ def tool_build(
         # 5) fake 彩排门:不 PASS 不许烧真预算
         fake = run_host_guided_cli(contract, project_root, fake="positive", batch=batch)
         fk = fake.get("report") or {}
-        stages["rehearsal"] = _rehearsal_stage(fk)
-        if fk.get("verdict") != "PASS_ADAPTED":
-            return {"task_id": task_id, "stages": stages, "verdict": f"REHEARSAL_{fk.get('verdict')}", "exported": None}
-
-        if not run_real:
-            return {"task_id": task_id, "stages": stages, "verdict": "REHEARSAL_PASS_ONLY", "exported": None}
+        rehearsed = rehearsal_after_positive_control(
+            stages=stages, task_id=task_id, project_root=project_root, rehearsal_report=fk
+        )
+        if rehearsed["verdict"] != "REHEARSAL_PASS_ONLY" or not run_real:
+            return rehearsed
 
         # 6) 真模型单发(provider 从 env;未配置由 preflight 如实拦)
         real = run_host_guided_cli(

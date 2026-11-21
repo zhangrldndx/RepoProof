@@ -137,12 +137,19 @@ class FrozenDeliveryOutputRequirement(BaseModel):
     role: str
 
 
+# The one definition of how a tool may reach the network: offline, public
+# credential-free hosts declared in the contract, or anything else (which no
+# profile supports).  Every model spells it through this alias
+# (incident-network-mode-literal-duplicated-*).
+NetworkMode = Literal["offline", "open_api", "required"]
+
+
 class FrozenDeliveryRequirements(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     inputs: list[FrozenDeliveryInputRequirement]
     outputs: list[FrozenDeliveryOutputRequirement]
-    network: Literal["offline", "required"]
+    network: NetworkMode
     credentials: Literal["none", "required"]
     lifecycle: Literal["per_invocation", "long_running"]
     runtime: Literal["local_cpu", "gpu", "remote_service"]
@@ -381,10 +388,13 @@ class ToolInterface(BaseModel):
 WorkspaceValidationProfile = Literal[
     "binary_v1",
     "csv_v1",
+    "epub_v1",
+    "geojson_v1",
     "html_v1",
     "ics_v1",
     "ipynb_v1",
     "mo_v1",
+    "pdf_v1",
     "png_v1",
     "pptx_v1",
     "xlsx_v1",
@@ -459,6 +469,10 @@ class WorkspaceArtifactRule(BaseModel):
     min_count: int = Field(default=1, ge=0, le=512)
     max_count: int = Field(default=1, ge=1, le=512)
     executable: bool = False
+    # Which user-named deliverables (from Core's intent reading) this rule
+    # satisfies.  Public, value-free, and absent from every earlier frozen
+    # contract (incident-deliverable-silently-narrowed-*).
+    satisfies: tuple[str, ...] = Field(default_factory=tuple, max_length=8)
 
     @field_validator("path_pattern")
     @classmethod
@@ -491,6 +505,18 @@ class WorkspaceArtifactLimits(BaseModel):
     max_path_bytes: int = Field(default=240, ge=1, le=240)
 
 
+# Every delivery profile whose artifact is a directory workspace.  The
+# open-API workspace shares the whole workspace machinery (contract, fixtures,
+# sealed runs, acceptance tests) and differs only in what its runtime may read.
+WORKSPACE_PROFILE_IDS: frozenset[str] = frozenset({"workspace_bundle_v1", "open_api_workspace_v1"})
+
+
+def is_workspace_profile(profile_id: object) -> bool:
+    """True for any profile that delivers a directory workspace."""
+
+    return str(profile_id or "") in WORKSPACE_PROFILE_IDS
+
+
 class WorkspaceArtifactContractV1(BaseModel):
     """Machine-executable contract for one offline directory artifact."""
 
@@ -510,6 +536,28 @@ class WorkspaceArtifactContractV1(BaseModel):
     # links closed); per-file profiles cannot see across files.  Optional and
     # absent from every earlier frozen contract.
     directory_profiles: tuple[str, ...] = Field(default_factory=tuple, max_length=4)
+    # Public hosts the delivered tool may GET at runtime (open_api_workspace_v1).
+    # Lowercase host names only — no scheme, path, port or credentials — so the
+    # sealed run can allow-list them by name.  Absent from every earlier frozen
+    # contract; the default keeps those contracts byte-for-byte loadable.
+    open_api_hosts: tuple[str, ...] = Field(default_factory=tuple, max_length=8)
+
+    @field_validator("open_api_hosts")
+    @classmethod
+    def _plain_public_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        import re
+
+        checked: list[str] = []
+        for raw in value:
+            host = str(raw).strip().lower()
+            if not host or "://" in host or "/" in host or ":" in host or "@" in host:
+                raise ValueError(f"open_api_hosts entries are bare host names: {raw!r}")
+            if re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+", host) is None:
+                raise ValueError(f"open_api_hosts entry is not a public host name: {raw!r}")
+            checked.append(host)
+        if len(checked) != len(set(checked)):
+            raise ValueError("open_api_hosts must be unique")
+        return tuple(checked)
 
     @field_validator("directory_profiles")
     @classmethod
@@ -680,8 +728,8 @@ class ToolSpec(BaseModel):
             if self.delivery_profile_id is not None or self.workspace_contract is not None:
                 raise ValueError("ToolSpec v1-v3 cannot declare workspace delivery")
             return self
-        if self.delivery_profile_id != "workspace_bundle_v1":
-            raise ValueError("ToolSpec v4 requires workspace_bundle_v1")
+        if not is_workspace_profile(self.delivery_profile_id):
+            raise ValueError("ToolSpec v4 requires a workspace delivery profile")
         if self.workspace_contract is None:
             raise ValueError("ToolSpec v4 requires workspace_contract")
         if self.interface.input.kind not in {"file", "directory"}:

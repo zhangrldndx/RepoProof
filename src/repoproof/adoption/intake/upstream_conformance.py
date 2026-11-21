@@ -691,17 +691,28 @@ def pinned_source_tree_shadowing(
         if path.is_file() and not path.is_symlink()
     }
     present = _runtime_members(present)
-    missing = sorted(released - present)
+    absent = sorted(released - present)
+    # 缺的文件若能由**在场的源文件**派生(编译翻译 .mo ↔ 同目录 .po;gettext 缺
+    # .mo 时回退到消息 id),它不是"不在",只是没编译——功能可用。
+    derivable = [name for name in absent if _derivable_from_present(name, present)]
+    missing = [name for name in absent if name not in set(derivable)]
+    # 遮蔽只在源码包直接位于检出根目录时才发生:密封 PYTHONPATH 只含检出根目录,
+    # src/ 布局下发行版根本没被遮蔽,缺多少构建期文件都与生产者无关。
+    shadows_producer = (upstream_dir / top).is_dir() and not (upstream_dir / top).is_symlink()
     # 有缺失不等于顶不住。真实形态相差极大:一个仓库缺的是编译出来的界面翻译
     # (源文件都在),另一个缺的是构建期生成的版本号——两者都跑通了;而"包等于
     # 不在"的那个仓库,源码树只有发行版**不到零头**的运行期文件。所以判死的
     # 条件是「多数运行期文件缺失」——不是调出来的阈值,而是一句话:源码树里
     # 没有的,比有的还多,它就不是发行版的替身。
     severity = "COMPLETE"
-    if missing:
+    if not shadows_producer:
+        severity = "NOT_SHADOWING"
+    elif missing:
         severity = (
             "PACKAGE_LARGELY_ABSENT" if len(missing) * 2 > len(released) else "PARTIAL"
         )
+    elif derivable:
+        severity = "DERIVABLE"
     remediation = ""
     if severity == "PACKAGE_LARGELY_ABSENT":
         remediation = (
@@ -722,6 +733,18 @@ def pinned_source_tree_shadowing(
         "source_files": len(present),
         "missing_count": len(missing),
         "missing_sample": tuple(missing[:8]),
+        "derivable_count": len(derivable),
+        "shadows_producer": shadows_producer,
         "wheel": wheel.name,
         "remediation": remediation,
     }
+
+
+_DERIVABLE_SUFFIXES = {".mo": ".po"}
+
+
+def _derivable_from_present(name: str, present: set[str]) -> bool:
+    for built, source in _DERIVABLE_SUFFIXES.items():
+        if name.endswith(built) and (name[: -len(built)] + source) in present:
+            return True
+    return False

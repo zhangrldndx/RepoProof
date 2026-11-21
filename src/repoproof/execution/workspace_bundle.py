@@ -342,16 +342,31 @@ def _divergence_locus(actual: Path, expected: Path) -> str:
                 for name in sorted(names_one | names_two):
                     if name not in names_one or name not in names_two:
                         return f"{name} (one side only)"
-                    if one.read(name) != two.read(name):
-                        return name
+                    member_one, member_two = one.read(name), two.read(name)
+                    if member_one != member_two:
+                        # A text member names its line too: the member alone
+                        # left four producer repairs guessing which stamp
+                        # inside it drifted (incident-drift-locus-stops-at-the-zip-member-*).
+                        inner = _text_locus(member_one, member_two)
+                        return f"{name}: {inner}" if inner else name
         except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
             return ""
         return ""
+    return _text_locus(left_bytes, right_bytes)
+
+
+def _text_locus(left_bytes: bytes, right_bytes: bytes) -> str:
+    """First differing line of two UTF-8 texts, quoting the ACTUAL (left) side only."""
+
     try:
-        left_lines = left_bytes.decode("utf-8").splitlines()
-        right_lines = right_bytes.decode("utf-8").splitlines()
+        left_text = left_bytes.decode("utf-8")
+        right_text = right_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return ""
+    if "\x00" in left_text or "\x00" in right_text:
+        return ""
+    left_lines = left_text.splitlines()
+    right_lines = right_text.splitlines()
     for index, (a, b) in enumerate(zip(left_lines, right_lines, strict=False), start=1):
         if a != b:
             excerpt = a.strip()[:_LOCUS_EXCERPT_CHARS]

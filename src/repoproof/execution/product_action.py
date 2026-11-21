@@ -21,6 +21,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.execution.audit_failure import (
     AuditFailureClass,
     AuditFailureStage,
@@ -231,7 +232,7 @@ class ProductActionResultV2(_ProductActionResultBase):
 
     @model_validator(mode="after")
     def _validate_workspace_result(self) -> ProductActionResultV2:
-        if self.delivery_profile_id != "workspace_bundle_v1":
+        if not is_workspace_profile(self.delivery_profile_id):
             return self
         if self.artifact_kind != "directory":
             raise ValueError("workspace_bundle_v1 requires artifact_kind=directory")
@@ -536,6 +537,7 @@ def workspace_action_result_from_payload(
     artifact_tree_sha256: str | None,
     artifact_manifest_sha256: str | None,
     workspace_structure_passed: bool | None,
+    delivery_profile_id: str = "workspace_bundle_v1",
 ) -> ProductActionResultV2:
     """Project a workspace action while retaining all v1 failure semantics."""
 
@@ -554,7 +556,7 @@ def workspace_action_result_from_payload(
     values["artifacts"] = artifacts
     return ProductActionResultV2(
         **values,
-        delivery_profile_id="workspace_bundle_v1",
+        delivery_profile_id=delivery_profile_id,
         artifact_kind="directory",
         artifact_root=root,
         artifact_tree_sha256=artifact_tree_sha256,

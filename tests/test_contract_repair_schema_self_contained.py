@@ -40,6 +40,7 @@ def test_repair_schema_resolves_every_ref_locally() -> None:
                     "min_count": 1,
                     "max_count": 1,
                     "executable": False,
+                    "satisfies": [],
                 }
             ],
             "allow_extra_files": False,
@@ -48,6 +49,7 @@ def test_repair_schema_resolves_every_ref_locally() -> None:
             "smoke_command": [],
             "smoke_timeout_seconds": 5,
             "require_offline_wheelhouse": False,
+            "open_api_hosts": [],
             "runtime_python_entrypoint": None,
             "directory_profiles": [],
             "limits": {

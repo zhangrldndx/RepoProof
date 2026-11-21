@@ -2098,6 +2098,9 @@ def run_dsh_round(*, workspace: Path, side_dir: Path, prompt: str,
     return result, info
 
 
+# Acceptance-time measurement channel honoured by the delivered launcher.
+_HOOK_EXTRA_PATH_ENV = "REPOPROOF_EXTRA_PYTHONPATH"
+
 class HostGuidedRunner:
     """宿主级 guided runner。所有 exec 走 LocalWorktreeBackend(净化环境/
     假 HOME/护栏/cwd 钉死焊在后端);oracle 路径永不进入会话与 agent 环境。"""
@@ -2616,6 +2619,10 @@ class HostGuidedRunner:
             hook_dir = write_hook_dir(self.store.run_dir / "import_hook")
             env.update({
                 "PYTHONPATH": str(hook_dir),
+                # The delivered launcher overrides PYTHONPATH; this named
+                # channel is how the hook reaches the tool process
+                # (incident-receipt-hook-never-reaches-the-tool-process-*).
+                _HOOK_EXTRA_PATH_ENV: str(hook_dir),
                 ENV_MODULE: mod,
                 ENV_LEDGER: str(self.store.run_dir / f"import_receipts_{tag}.jsonl"),
                 ENV_SECRET: self._hook_secret,

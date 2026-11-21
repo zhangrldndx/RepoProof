@@ -399,21 +399,31 @@ def test_k11_the_heldout_prose_is_derived_from_data_not_written_down():
     # PRODUCT/HARNESS_SELFCHECK 和 PRODUCT_ONBOARDING 发次入账。四项
     # counts_toward_* 均为 false,不计 Benchmark Lab 模型能力,但共享台账的
     # hosts_covered 仍按 append-only 事实增加这些本地工具宿主。
+    # 2026-09-05 M6.4 phase 1:开放 API 仪表盘批次的三个彩排宿主入账(altair/bokeh/holidays
+    # 的 *-tool;PRODUCT 记录 counts_toward_* 均为 false,仍按 append-only 事实增加宿主)。
     assert d["hosts_covered"] == [
         # 2026-08-30/31 M6.1 两轮多格式 Product Journey 入账；均为
         # PRODUCT 或 HARNESS_SELFCHECK，不计 Benchmark Lab 模型能力。
+        "local-tool/altair-tool",
         "local-tool/biopython-fasta-shortlist",
         "local-tool/biopython-tool",
+        "local-tool/bokeh-tool",
         "local-tool/chardet-tool",
         # 2026-09-02 M6.2 修复后 workspace 案例(Product 记录,不计 Lab):
         # csvkit / marimo / pdfplumber / research-project-starter / trafilatura
         # 各自的真实 Agent 发次入账,台账 append-only,棘轮再翻五页。
         "local-tool/csvkit-tool",
         "local-tool/datasette-tool",
+        # 2026-09-06 M6.4 phase 1(open_api 工作区,Product 记录):d5 `tool-ebooklib-tool-v1`
+        # 与 d7 `tool-matplotlib-tool-v1` 零人工到达彩排,正控发入账,棘轮再翻两页。
+        "local-tool/ebooklib-tool",
         "local-tool/emoji-tool",
         "local-tool/feedparser-tool",
         "local-tool/filetype-tool",
         "local-tool/ftfy-tool",
+        # 2026-09-06 M6.4 attempt23:d8 `tool-geojson-tool-v2` 零人工到达彩排(回执钩子摘要不再跑用户 __repr__)。
+        "local-tool/geojson-tool",
+        "local-tool/holidays-tool",
         "local-tool/html2md",
         "local-tool/humanize-tool",
         # 2026-09-03 M6.3 第十一轮:c6 `tool-icalendar-tool-v1` 零人工到达彩排
@@ -428,6 +438,7 @@ def test_k11_the_heldout_prose_is_derived_from_data_not_written_down():
         "local-tool/marimo-tool",
         "local-tool/markdown-it-py-tool",
         "local-tool/markdown-tool",
+        "local-tool/matplotlib-tool",
         # 2026-09-04 M6.3 第十五轮:c5 `tool-mkdocs-tool-v1` 零人工到达彩排并转
         # ACTIVE(批次 EXPLORATORY_UNPREREGISTERED)。棘轮再翻一页。
         "local-tool/mkdocs-tool",
@@ -438,6 +449,7 @@ def test_k11_the_heldout_prose_is_derived_from_data_not_written_down():
         "local-tool/networkx-tool",
         "local-tool/num2words-tool",
         "local-tool/opencc-tool",
+        "local-tool/openmeteo-sdk-tool",
         "local-tool/pdf-table",
         "local-tool/pdfplumber-tool",
         "local-tool/phonenumbers-tool",
@@ -446,6 +458,7 @@ def test_k11_the_heldout_prose_is_derived_from_data_not_written_down():
         "local-tool/pint-tool",
         # 2026-09-03 M6.3 第十七轮:c3 `tool-pygal-tool-v2` 零人工到达彩排(归属筛查
         # 与一致性探针修复后;零模型离线彩排发,批次 EXPLORATORY_UNPREREGISTERED)。
+        "local-tool/plotly-tool",
         "local-tool/pygal-tool",
         "local-tool/pygments-tool",
         "local-tool/pypdf-tool",
@@ -458,6 +471,8 @@ def test_k11_the_heldout_prose_is_derived_from_data_not_written_down():
         "local-tool/python-slugify-tool",
         "local-tool/pyyaml-tool",
         "local-tool/research-project-starter",
+        # 2026-09-06 M6.4 attempt19:d9 `tool-rich-tool-v1` 正控发入账(彩排后实况探针 405 边界)。
+        "local-tool/rich-tool",
         "local-tool/rispy-screening-table",
         "local-tool/rispy-tool",
         "local-tool/rrule-expand",

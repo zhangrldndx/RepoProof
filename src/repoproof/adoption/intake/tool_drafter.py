@@ -37,6 +37,7 @@ from repoproof.adoption.delivery.portable_workspace_runtime import (
 )
 from repoproof.adoption.delivery.product_profile import (
     CLI_V2_PROFILE_ID,
+    OPEN_API_WORKSPACE_PROFILE_ID,
     WORKSPACE_BUNDLE_PROFILE_ID,
     ProductProfileError,
     assess_requirement_brief,
@@ -62,11 +63,12 @@ from repoproof.adoption.intake.tool_confirm import (
 )
 from repoproof.adoption.intake.tool_intake import ToolIntakeReport
 from repoproof.adoption.intake.workspace_fixtures import (
+    BLOCKING_BOUNDARY_CODES,
     FixtureBlueprintV1,
     project_fixture_blueprint_portable_paths,
     validate_fixture_blueprint_portable_paths,
 )
-from repoproof.domain.models import WorkspaceArtifactContractV1
+from repoproof.domain.models import WorkspaceArtifactContractV1, is_workspace_profile
 
 _LLM_FIELDS = ("tool.summary", "tool.interface.input.format",
                "tool.interface.output.format", "tool.interface.output.contract",
@@ -145,6 +147,169 @@ _INPUTS_SYSTEM = (
     "human. Inputs must be plain UTF-8 text."
 )
 
+# Open-API workspace rules (m6.4).  The sealed gate kills a producer that steps
+# outside the recording; every prompt that can author or repair one must teach
+# the same rules first (闸门要杀的先教).  Keep these free of case identifiers.
+_OPEN_API_DRAFT_RULES = (
+    " When delivery_requirements.network is open_api (the tool itself must read "
+    "public, credential-free HTTP endpoints at invocation time) the system selects "
+    "open_api_workspace_v1: identical to workspace_bundle_v1 except that the producer "
+    "may perform GET requests to the hosts the contract declares. Every declared host is a real "
+    "public host (never a placeholder such as *.test, *.example, example.com, localhost or an IP "
+    "literal — the rehearsal probes each host live); synthetic scenario data lives in the recorded "
+    "response bodies, not in invented host names. Declare "
+    "workspace_contract.open_api_hosts: the lowercase public hostnames the producer "
+    "will call (no scheme, path or port), nothing else. The producer must route every "
+    "request through the environment variable REPOPROOF_OPEN_API_BASE_URLS when it is "
+    "present: a JSON object mapping each declared host to a base URL (for example "
+    "http://127.0.0.1:PORT/host); build each URL as base + path + canonical query "
+    "(parameters sorted by name), GET only, and fall back to https://host only when the "
+    "variable is absent. Validate the input and the output directory before the first "
+    "request. The Harness verifies sealed and offline: it serves recorded responses at "
+    "that base, rejects a request outside the recording "
+    "(WORKSPACE_REFERENCE_UNRECORDED_REQUEST), rejects a recording the producer never requests "
+    "(WORKSPACE_REFERENCE_UNUSED_RECORDING — requests and recordings agree both ways; the judge "
+    "recomputes only from bodies the producer can reach), rejects a canary credential copied into a "
+    "request or the artifact (WORKSPACE_REFERENCE_CREDENTIAL_LEAK), rejects a run that "
+    "never called the stub (WORKSPACE_REFERENCE_NO_API_CALLS) and rejects a fixture "
+    "without recordings (WORKSPACE_REFERENCE_RESPONSES_MISSING). Therefore every fixture "
+    "the builder writes must contain __responses__/manifest.json plus one body file per "
+    "recorded request (rows: method, host, path, query as a sorted a=b&c=d string, status, "
+    "content_type, body = a bare file name directly inside __responses__, no subdirectory, "
+    "no '/' or '..'); the manifest document is exactly "
+    "{\"schema_version\": 1, \"responses\": [row, ...]} (a top-level \"responses\" list); "
+    "the builder materializes those recordings from "
+    "blueprint parameters, never from the network, and the recorded body content is where "
+    "scenario variation lives. The producer and the builder must agree on the request keys: "
+    "derive the host, path and query the producer sends from the configuration file inside "
+    "the input directory and record exactly those keys. The producer never sees __responses__ (the Harness hides "
+    "it) and the artifact must be reproducible from the recordings alone: never read the "
+    "wall clock (take the reference time from the input or from a fetched_at field in "
+    "the response), never embed the base URL, never cache across runs. smoke_command runs "
+    "the delivered workspace alone and must not fetch anything: a runnable workspace "
+    "renders from the data files already inside the tree. An open-API tool takes exactly "
+    "one local directory input: the user's configuration file(s) live inside it and the "
+    "Harness places __responses__ beside them, so declare inputs[0].kind=directory and "
+    "interface.input.kind=directory (a file input cannot hold the recordings). "
+    "open_api_hosts is never empty: even when the user's configuration supplies the URLs "
+    "(subscription links, feeds), declare the public hosts your fixtures record — the sealed "
+    "run maps only declared hosts to the stub and a request to any other host fails — and say "
+    "in the README which hosts the tool supports. Exactly one fixture blueprint sets "
+    "live_anchor=true: its identifiers (repositories, accounts, ids, place codes, feed paths) "
+    "are real, public and known to exist today — for example the upstream repository being "
+    "packaged or a well-known public feed — so the rehearsal can ask the real host the same "
+    "requests; the other blueprints may use invented identifiers. The anchor's recorded bodies "
+    "are still written by the builder, never fetched. The anchor scenario asks every declared host "
+    "at least once: a host the anchor never asks cannot be checked against the world. When the "
+    "context carries known_boundaries (rows host/path/query/code/detail found by a rehearsal against "
+    "today's real hosts), never let the producer or any fixture request an endpoint listed with "
+    "PLATFORM_REQUIRES_CREDENTIALS or ENDPOINT_GONE: use a credential-free endpoint of the same host, "
+    "another declared host, or drop that source and say so in the README; for RESPONSE_SHAPE_DRIFTED "
+    "rows, record bodies in exactly the shape of live_shape (the keys and value types the real host "
+    "answered with) and make the producer and judge read those fields; METHOD_NOT_ALLOWED rows name "
+    "an endpoint that rejects GET — this profile only ever sends GET, so use a GET endpoint of that "
+    "host or another declared host (never a POST/PUT endpoint)."
+)
+_OPEN_API_REFERENCE_REPAIR_RULES = (
+    " For an open_api_workspace_v1 producer every request must go through "
+    "REPOPROOF_OPEN_API_BASE_URLS (a JSON object host -> base URL) when that variable is "
+    "set, GET only, query string in sorted canonical form, after the input and output "
+    "directory were validated. WORKSPACE_REFERENCE_UNRECORDED_REQUEST names a request the "
+    "recording does not contain: fix the host, path or query the producer builds, never "
+    "widen the recording. WORKSPACE_REFERENCE_CREDENTIAL_LEAK means the producer copied a "
+    "canary from its environment or a response into a request or the artifact: strip it. "
+    "WORKSPACE_REFERENCE_NO_API_CALLS means the producer never reached the stub: it read "
+    "the network directly, used a cache, or short-circuited."
+)
+_OPEN_API_BUILDER_REPAIR_RULES = (
+    " For open_api_workspace_v1 fixtures the builder must also write "
+    "output_path/__responses__/manifest.json — exactly {\"schema_version\": 1, "
+    "\"responses\": [row, ...]} with rows of method, host, path, query, status, "
+    "content_type, body — plus every body file it names; the "
+    "match key is host + path + canonical query (parameters sorted by name, joined with "
+    "&). WORKSPACE_REFERENCE_RESPONSES_MISSING means a fixture lacks the manifest or a "
+    "body file it names. WORKSPACE_REFERENCE_UNRECORDED_REQUEST lists the exact GET "
+    "host/path?query the producer asked for: record exactly those keys, one body each, with "
+    "content derived from the blueprint parameters (the same handles, ids and pages the "
+    "configuration names); do not rename paths or queries the producer uses. Record nothing "
+    "the producer will not request: a body the producer cannot discover (an id no fetched body "
+    "names) is WORKSPACE_REFERENCE_UNUSED_RECORDING. Recorded "
+    "bodies come from blueprint parameters, never from the network."
+)
+_EXCEPTION_DETAIL_RULES = (
+    " When a reason detail reports an exception raised by the upstream or by the artifact, "
+    "include the exception's own message (str(exc)[:160]) together with its type; a type name "
+    "alone cannot be repaired from."
+)
+_OPEN_API_VERIFIER_RULES = (
+    " For open_api_workspace_v1 the input directory the verifier receives contains "
+    "__responses__/manifest.json and the recorded response bodies the producer was "
+    "served. The manifest document is exactly {\"schema_version\": 1, \"responses\": [row, ...]} — a "
+    "top-level \"responses\" list (never requests or rows) whose rows carry method, host, path, "
+    "query (sorted a=b&c=d string), status, content_type and body (the body file name inside "
+    "__responses__); recompute every commitment from those recordings (json plus pathlib), never "
+    "call the network and never read the wall clock. The recording defines the request "
+    "set: recorded_requests (when supplied) lists exactly the GET keys the fixtures hold; "
+    "read the manifest rows, match bodies by the host, path and query that are actually "
+    "present, and never require or demand an endpoint the recording lacks. A commitment "
+    "that cannot be recomputed from any recorded body is reported as "
+    "VERIFIER_INPUT_INSUFFICIENT naming that commitment, never by inventing a request. "
+    "recorded_body_shapes (when supplied) gives each recorded body's JSON shape — its keys and "
+    "value types — so recompute from the fields that exist there; a field the recording lacks "
+    "is not a reason to demand it, and the producer's own reading of those fields is the one "
+    "you must reproduce."
+)
+_OUTPUT_DIR_RULES = (
+    " output_dir does not exist when build_workspace is called: create it (mkdir, parents "
+    "allowed) and write the workspace inside; its absence is never a user error. "
+    "UserInputError is reserved for defects in the contents of input_path."
+)
+_OWN_SOURCE_RULES = (
+    " Never derive a delivered file from the producer's own source: Path(__file__), "
+    "inspect.getsource and similar self-reads are rejected (REFERENCE_READS_ITS_OWN_SOURCE) "
+    "because the Harness stages the producer under other names and beside a protocol bridge, "
+    "so the bytes would differ between runs; write the application file and every other "
+    "delivered file from an explicit literal string."
+)
+_INTENT_READING_DRAFT_RULES = (
+    " intent_reading, when supplied, is Core's admitted reading of the user's request, each "
+    "item carrying a verbatim quote from the request as evidence. data_sources says where every "
+    "piece of data lives: user_local (the user said they have it), public_service (a public "
+    "endpoint must be read at invocation time) or pinned_library (the pinned upstream ships it); "
+    "deliverables names what the user asked to receive. Honour it: any public_service source "
+    "makes delivery_requirements.network at least open_api with the hosts declared; never turn "
+    "a public_service source into a user-supplied file or user-supplied snapshot; every "
+    "deliverable must be satisfied by at least one workspace_contract rule that lists its name "
+    "in that rule's satisfies, and a non-text deliverable therefore needs the workspace "
+    "profile, not cli_v2."
+)
+_DASHBOARD_DATA_LAYER_DRAFT_RULES = (
+    " When the deliverable is an HTML dashboard or chart page, its semantics live "
+    "in a data layer, not in the rendered markup: the producer must embed the "
+    "plotted data as one script element of type application/json with a stable id "
+    "(or ship one sidecar .json file the page loads), the artifact_protocol must "
+    "locate that data layer and every observation must read values from it, and "
+    "the chart library must be embedded or shipped as a contracted workspace file, "
+    "never referenced from a CDN (the structure gate rejects external resources)."
+)
+_DASHBOARD_DATA_LAYER_VERIFIER_RULES = (
+    " For an HTML dashboard or chart page the data layer is the script element of "
+    "type application/json (or the sidecar .json file) that the artifact_protocol "
+    "locates: find it with html.parser, load it with json, and compare its values "
+    "with your own recomputation from the input; never judge the rendered markup or "
+    "the chart-library bundle, and treat a data layer that does not parse as a "
+    "rejection with its own reason code."
+)
+_OPEN_API_INPUTS_RULES = (
+    " When seed_blueprints carry recorded response content (keys describing hosts, "
+    "paths and the payload served), vary that recorded content — counts, ordering, "
+    "timestamps, empty pages, unusual but valid payloads — because the recorded "
+    "response is the scenario; keep hosts and paths within the seed's set. Never set "
+    "live_anchor on a proposed scenario: keep invented identifiers — the live anchor is a "
+    "property of the drafted set, not of a fresh probe."
+)
+
+
 _WORKSPACE_INPUTS_SYSTEM = (
     "You propose NEW natural input scenarios for a frozen offline workspace tool. "
     "Output STRICT JSON only with exactly one key, fixture_blueprints. Return "
@@ -159,6 +324,7 @@ _WORKSPACE_INPUTS_SYSTEM = (
     "value that represents a relative file/path name must use portable ASCII POSIX "
     "characters only (A-Z, a-z, 0-9, dot, underscore, at, plus, hyphen and slash). "
     "Do not repeat excluded_blueprint_ids or excluded_parameter_fingerprints."
+    + _OPEN_API_INPUTS_RULES
 )
 
 
@@ -203,6 +369,15 @@ _SYSTEM = (
     "the frozen fixture builder). Never place PDF/database/archive bytes in JSON. "
     "A runnable workspace must expose "
     "an executable entrypoint and smoke_command beginning with ./ plus that entrypoint. "
+    "Never write a JavaScript or CSS library from memory: a delivered .js/.css file of 1 KB or more "
+    "must be byte-identical to a file the pinned upstream ships (FRONTEND_ASSET_NOT_FROM_UPSTREAM "
+    "otherwise); when the upstream ships no such library, an interactive page cannot be delivered "
+    "offline — deliver a static image (SVG/PNG) plus data files (JSON/CSV) and say so in the "
+    "README; a known_boundaries row with that code means exactly this. "
+    "reference_impl may import only the Python standard library, the pinned upstream and the "
+    "distributions the upstream itself requires — the sealed run has nothing else, so pandas, "
+    "numpy, requests or any other package the upstream does not require raises ModuleNotFoundError "
+    "(WORKSPACE_REFERENCE_DEPENDENCY_MISSING) before the first line of your producer runs. "
     "For every runnable Python workspace, Core owns a sealed offline runtime closure. "
     "Set require_offline_wheelhouse=true and runtime_python_entrypoint to the "
     "non-executable Python application file that the generated workspace will contain; "
@@ -268,6 +443,11 @@ _SYSTEM = (
     "inputs but never rules. Do not "
     "default to JSON unless the user's final requirement actually asks for a "
     "machine-readable JSON artifact. No extra keys."
+    + _OPEN_API_DRAFT_RULES
+    + _DASHBOARD_DATA_LAYER_DRAFT_RULES
+    + _INTENT_READING_DRAFT_RULES
+    + _OWN_SOURCE_RULES
+    + _OUTPUT_DIR_RULES
 )
 
 _CODEX_DRAFT_SYSTEM = _SYSTEM
@@ -328,6 +508,9 @@ _VERIFIER_SYSTEM = (
     "whole check. Read delivered artifacts with the standard library: a zip-container "
     "document through zipfile plus xml.etree, HTML through html.parser, and structured "
     "text through json/csv/configparser."
+    + _OPEN_API_VERIFIER_RULES
+    + _DASHBOARD_DATA_LAYER_VERIFIER_RULES
+    + _EXCEPTION_DETAIL_RULES
 )
 
 _CODEX_VERIFIER_SYSTEM = _VERIFIER_SYSTEM
@@ -384,7 +567,10 @@ _WORKSPACE_REFERENCE_REPAIR_SYSTEM = (
     "only explicit input-domain exception types to UserInputError so programming "
     "and upstream-API errors remain observable to the Harness. Do not call the "
     "network, spawn subprocesses, inspect examples/oracles/verifiers, or change "
-    "task semantics. The workspace must be byte-reproducible: two runs on the same "
+    "task semantics. WORKSPACE_REFERENCE_DEPENDENCY_MISSING names a module the sealed "
+    "runtime does not have (only the standard library, the pinned upstream and what it "
+    "requires exist there): remove that import and compute with what is available. "
+    "The workspace must be byte-reproducible: two runs on the same "
     "input, seconds apart, must produce identical trees. When the failure is "
     "WORKSPACE_REFERENCE_NOT_REPRODUCIBLE the diagnostics name each drifting path "
     "and kind (ZIP_METADATA_ONLY = container member timestamps; BYTES_DIFFER = "
@@ -402,6 +588,9 @@ _WORKSPACE_REFERENCE_REPAIR_SYSTEM = (
     "external files, so the application file build_workspace writes must exit 0 under "
     "exactly that command (treat a missing input argument as a usage request that "
     "exits 0, support --help, or read only files the workspace itself contains)."
+    + _OPEN_API_REFERENCE_REPAIR_RULES
+    + _OWN_SOURCE_RULES
+    + _OUTPUT_DIR_RULES
 )
 
 _WORKSPACE_CONTRACT_REPAIR_SYSTEM = (
@@ -434,7 +623,12 @@ _WORKSPACE_CONTRACT_REPAIR_SYSTEM = (
 _VERIFIER_REPAIR_SYSTEM = (
     "You repair ONLY a pre-freeze independent semantic verifier after a deterministic "
     "Harness check found a public output-contract incompatibility OR a disagreement "
-    "between a successful contract-valid reference artifact and this verifier. You are isolated "
+    "between a successful contract-valid reference artifact and this verifier. "
+    "UPSTREAM_CALL_NOT_OBSERVED means this verifier never called the pinned upstream module: "
+    "import it and make the verdict depend on values it returns (decode, parse or recompute "
+    "with the upstream's own API rather than by hand); the receipts count invocations of "
+    "upstream functions or classes only — an import or an attribute read such as "
+    "module.__version__ is not a call. You are isolated "
     "from the reference implementation, candidate inputs, candidate outputs, golden "
     "examples and held-out data. The supplied user goal, semantic commitments, "
     "artifact protocol, delivery requirements, ToolOutputContract and pinned upstream identity are "
@@ -470,6 +664,9 @@ _VERIFIER_REPAIR_SYSTEM = (
     "whole check. Read delivered artifacts with the standard library: a zip-container "
     "document through zipfile plus xml.etree, HTML through html.parser, and structured "
     "text through json/csv/configparser."
+    + _OPEN_API_VERIFIER_RULES
+    + _DASHBOARD_DATA_LAYER_VERIFIER_RULES
+    + _EXCEPTION_DETAIL_RULES
 )
 _FIXTURE_BUILDER_REPAIR_SYSTEM = (
     "You repair ONLY a pre-freeze fixture builder and its 3-4 natural scenario "
@@ -488,6 +685,7 @@ _FIXTURE_BUILDER_REPAIR_SYSTEM = (
     "Only use parameter values the builder can encode; when the public failure is an "
     "encoding class, keep all parameter text inside the builder's supported character "
     "set. Returning byte-identical builder source and identical blueprints is invalid."
+    + _OPEN_API_BUILDER_REPAIR_RULES
 )
 
 _CODEX_REFERENCE_REPAIR_SYSTEM = _REFERENCE_REPAIR_SYSTEM
@@ -692,6 +890,7 @@ _FIXTURE_BLUEPRINT_SCHEMA = {
             "title": {"type": "string", "minLength": 1, "maxLength": 160},
             "scenario": {"type": "string", "minLength": 1, "maxLength": 1200},
             "input_kind": {"type": "string", "enum": ["file", "directory"]},
+            "live_anchor": {"type": "boolean"},
             # Structured-output clients cannot accept an arbitrary-property
             # object schema.  The model returns a bounded JSON string; Core
             # parses and validates it before the task-owned builder sees it.
@@ -730,7 +929,61 @@ def _schema_with_pinned_input_kind(schema: dict[str, Any], input_kind: str) -> d
     if not isinstance(properties, dict) or "input_kind" not in properties:
         return schema
     properties["input_kind"] = {"type": "string", "enum": [input_kind]}
+    # The delivery requirement carries the same fact; pin it wherever the
+    # schema exposes it so the model is never asked to guess a topology Core
+    # already knows (incident-open-api-input-kind-unconstrained-*).
+    requirements = node.get("delivery_requirements")
+    inputs = requirements.get("properties", {}).get("inputs") if isinstance(requirements, dict) else None
+    input_items = inputs.get("items") if isinstance(inputs, dict) else None
+    input_properties = input_items.get("properties") if isinstance(input_items, dict) else None
+    if isinstance(input_properties, dict) and "kind" in input_properties:
+        input_properties["kind"] = {"type": "string", "enum": [input_kind]}
     return pinned
+
+
+def _context_wants_workspace(context: dict) -> bool:
+    """Core already knows a non-text deliverable needs the workspace profile."""
+
+    reading = context.get("intent_reading")
+    if not isinstance(reading, dict):
+        return False
+    return any(
+        str((row or {}).get("form")) not in _TEXT_ONLY_FORMS
+        for row in (reading.get("deliverables") or ())
+        if isinstance(row, dict)
+    )
+
+
+def _schema_with_pinned_output_topology(schema: dict[str, Any], *, workspace: bool) -> dict[str, Any]:
+    """Pin outputs[].kind=directory and format_id=workspace_bundle when Core knows the deliverable.
+
+    A guessed format_id used to end the journey as an admission verdict
+    (incident-output-format-guess-rejected-at-admission-*).
+    """
+
+    if not workspace:
+        return schema
+    pinned = deepcopy(schema)
+    requirements = (pinned.get("properties") or {}).get("delivery_requirements")
+    outputs = requirements.get("properties", {}).get("outputs") if isinstance(requirements, dict) else None
+    items = outputs.get("items") if isinstance(outputs, dict) else None
+    properties = items.get("properties") if isinstance(items, dict) else None
+    if not isinstance(properties, dict):
+        return schema
+    if "kind" in properties:
+        properties["kind"] = {"type": "string", "enum": ["directory"]}
+    if "format_id" in properties:
+        properties["format_id"] = {"type": "string", "enum": ["workspace_bundle"]}
+    return pinned
+
+
+def _draft_schema_for(context: dict, base: dict[str, Any]) -> dict[str, Any]:
+    """Every topology fact Core already holds is pinned before the model is asked."""
+
+    return _schema_with_pinned_output_topology(
+        _schema_with_pinned_input_kind(base, _context_input_kind(context)),
+        workspace=_context_wants_workspace(context),
+    )
 
 
 def _context_input_kind(context: dict) -> str:
@@ -743,6 +996,11 @@ def _context_input_kind(context: dict) -> str:
             kind = str(inputs[0].get("kind") or "")
             if kind:
                 return kind
+    reading = context.get("intent_reading")
+    if isinstance(reading, dict) and required_network_for(reading.get("data_sources") or ()) == "open_api":
+        # An open-API tool's input is a directory by construction (the user's
+        # configuration plus the recordings the Harness places beside it).
+        return "directory"
     return str(context.get("input_kind") or "")
 
 
@@ -1221,6 +1479,7 @@ def _context_with_product_profile(context: dict) -> dict:
         "product_support_profiles": [
             product_delivery_profile(CLI_V2_PROFILE_ID).prompt_context(),
             product_delivery_profile(WORKSPACE_BUNDLE_PROFILE_ID).prompt_context(),
+            product_delivery_profile(OPEN_API_WORKSPACE_PROFILE_ID).prompt_context(),
         ],
     }
 
@@ -1232,47 +1491,17 @@ def reference_source_policy_errors(
 ) -> list[str]:
     """Return stable static policy errors for an unfrozen reference source."""
 
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return ["REFERENCE_SOURCE_SYNTAX_INVALID"]
-    expected_arguments = 2 if function_name == "build_workspace" else 1
-    extract = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == function_name
-            and len(node.args.args) == expected_arguments
-        ),
-        None,
-    )
-    if extract is None:
-        return [
-            "REFERENCE_BUILD_WORKSPACE_MISSING"
-            if function_name == "build_workspace"
-            else "REFERENCE_EXTRACT_MISSING"
-        ]
+    rows = reference_source_policy_diagnostics(source, function_name=function_name)
+    return [str(row["type"]).upper() for row in rows][:1]
 
-    def _is_broad(handler_type: ast.expr | None) -> bool:
-        if handler_type is None:
+
+def _reads_its_own_source(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "__file__":
             return True
-        if isinstance(handler_type, ast.Tuple):
-            return any(_is_broad(item) for item in handler_type.elts)
-        if isinstance(handler_type, ast.Name):
-            return handler_type.id in {"Exception", "BaseException"}
-        return bool(
-            isinstance(handler_type, ast.Attribute)
-            and handler_type.attr in {"Exception", "BaseException"}
-        )
-
-    if any(
-        _is_broad(node.type)
-        for node in ast.walk(extract)
-        if isinstance(node, ast.ExceptHandler)
-    ):
-        return ["REFERENCE_BROAD_EXCEPTION_MASKING"]
-    return []
+        if isinstance(node, ast.Attribute) and node.attr in {"getsource", "getsourcelines", "getsourcefile"}:
+            return True
+    return False
 
 
 def workspace_reference_runtime_ownership_policy_errors(
@@ -1374,15 +1603,110 @@ def workspace_reference_runtime_ownership_diagnostics(
     return rows
 
 
+def reference_source_policy_diagnostics(
+    source: str,
+    *,
+    function_name: str = "extract",
+) -> list[dict[str, str]]:
+    """The static policy rejections of an unfrozen reference, each with the line it points at.
+
+    ``loc`` is ``reference_impl:<line>`` (or ``reference_impl`` for a whole-file
+    fact) so the bounded projection repair argues from the offending line; a
+    bare code once ended a journey with the skeleton stub still in the bundle
+    (incident-reference-policy-error-has-no-repair-path-*).
+    """
+
+    def row(code: str, line: int | None, msg: str) -> dict[str, str]:
+        loc = f"reference_impl:{line}" if line else "reference_impl"
+        return {"loc": loc, "type": code.lower(), "msg": msg}
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        return [row("REFERENCE_SOURCE_SYNTAX_INVALID", exc.lineno, f"the reference does not parse: {exc.msg}")]
+    expected_arguments = 2 if function_name == "build_workspace" else 1
+    entry = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == function_name
+            and len(node.args.args) == expected_arguments
+        ),
+        None,
+    )
+    if entry is None:
+        code = (
+            "REFERENCE_BUILD_WORKSPACE_MISSING"
+            if function_name == "build_workspace"
+            else "REFERENCE_EXTRACT_MISSING"
+        )
+        return [
+            row(
+                code,
+                None,
+                f"the reference must define {function_name} with {expected_arguments} positional argument(s)",
+            )
+        ]
+
+    def _is_broad(handler_type: ast.expr | None) -> bool:
+        if handler_type is None:
+            return True
+        if isinstance(handler_type, ast.Tuple):
+            return any(_is_broad(item) for item in handler_type.elts)
+        if isinstance(handler_type, ast.Name):
+            return handler_type.id in {"Exception", "BaseException"}
+        return bool(
+            isinstance(handler_type, ast.Attribute)
+            and handler_type.attr in {"Exception", "BaseException"}
+        )
+
+    for node in ast.walk(entry):
+        if isinstance(node, ast.ExceptHandler) and _is_broad(node.type):
+            return [
+                row(
+                    "REFERENCE_BROAD_EXCEPTION_MASKING",
+                    node.lineno,
+                    f"a bare except / except Exception inside {function_name} masks failures the "
+                    "self-check must see; catch the specific exception class or let it propagate "
+                    "(bad user input raises UserInputError)",
+                )
+            ]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "__file__":
+            return [
+                row(
+                    "REFERENCE_READS_ITS_OWN_SOURCE",
+                    node.lineno,
+                    "the reference must not read __file__ or its own source",
+                )
+            ]
+        if isinstance(node, ast.Attribute) and node.attr in {"getsource", "getsourcelines", "getsourcefile"}:
+            return [
+                row("REFERENCE_READS_ITS_OWN_SOURCE", node.lineno, "the reference must not read its own source")
+            ]
+    return []
+
+
 def _validate_reference_source(
     source: str,
     *,
     prefix: str,
     function_name: str = "extract",
 ) -> None:
-    errors = reference_source_policy_errors(source, function_name=function_name)
-    if errors:
-        raise DraftError(f"{prefix}:{errors[0]}")
+    rows = reference_source_policy_diagnostics(source, function_name=function_name)
+    if not rows:
+        return
+    code = str(rows[0]["type"]).upper()
+    if prefix == "tool-draft":
+        # The drafting station: a projection fact with a line, repaired the way
+        # every other field-level rejection is.
+        error = DraftProjectionError(f"{prefix}:{code}")
+        error.__cause__ = _DocumentContradiction(
+            [{"loc": tuple(str(rows[0]["loc"]).split(":", 1)), "type": rows[0]["type"], "msg": rows[0]["msg"]}]
+        )
+        raise error
+    raise DraftError(f"{prefix}:{code}", diagnostics=rows)
 
 
 def _validate_fixture_builder_source(source: str) -> None:
@@ -1421,11 +1745,14 @@ def _validate_fixture_builder_source(source: str) -> None:
         return None
 
     parameters_bound = False
-    for node in ast.walk(build):
+    # Any function in the module may read the parameters (build often hands
+    # the blueprint to a helper); the boundary is that the bytes derive from
+    # blueprint["parameters"] somewhere, not that build itself subscripts it
+    # (incident-builder-binding-rejection-without-field-*).
+    for node in ast.walk(tree):
         if (
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
-            and node.value.id == blueprint_name
             and _literal_string(node.slice) == "parameters"
         ):
             parameters_bound = True
@@ -1435,15 +1762,18 @@ def _validate_fixture_builder_source(source: str) -> None:
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "get"
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == blueprint_name
             and node.args
             and _literal_string(node.args[0]) == "parameters"
         ):
             parameters_bound = True
             break
     if not parameters_bound:
-        raise DraftProjectionError(
-            "tool-draft:FIXTURE_BLUEPRINT_PARAMETER_BINDING_MISMATCH"
+        raise _projection_error(
+            "FIXTURE_BLUEPRINT_PARAMETER_BINDING_MISMATCH",
+            ("fixture_builder",),
+            f"build({blueprint_name}, output_path) receives the blueprint as a plain dict and the fixture "
+            f"bytes must derive from {blueprint_name}['parameters'] (or .get('parameters')) somewhere in the "
+            "module; no function reads the parameters, so every scenario would build the same bytes",
         )
     forbidden_modules = {
         "aiohttp",
@@ -1525,6 +1855,7 @@ def _normalize_fixture_blueprints(
                 scenario=str(raw.get("scenario") or ""),
                 input_kind=cast(Literal["file", "directory"], raw_input_kind),
                 parameters=parameters,
+                live_anchor=bool(raw.get("live_anchor", False)),
             )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise _projection_error(
@@ -1852,19 +2183,26 @@ def public_validation_diagnostics(exc: BaseException) -> list[dict[str, str]]:
     return []
 
 
-def _invalid_model_output_error(exc: BaseException) -> DraftError:
-    """Retain one allowlisted Core projection code without leaking model text."""
+def _invalid_model_output_error(exc: BaseException, *, attempts: list[dict] | None = None) -> DraftError:
+    """Retain one allowlisted Core projection code without leaking model text.
+
+    ``attempts`` (the refused documents with their rejections) ride along for
+    the draft bundle's forensics file; they never enter the public payload
+    (incident-builder-binding-rejection-without-field-*).
+    """
 
     diagnostics = public_validation_diagnostics(exc)
     message = str(exc)
     prefix = "tool-draft:"
-    if message.startswith(prefix):
-        reason = message.removeprefix(prefix)
-        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", reason):
-            return DraftError(
-                f"tool-draft:INVALID_MODEL_OUTPUT:{reason}", diagnostics=diagnostics
-            )
-    return DraftError("tool-draft:INVALID_MODEL_OUTPUT", diagnostics=diagnostics)
+    error: DraftError
+    if message.startswith(prefix) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", message.removeprefix(prefix)):
+        error = DraftError(
+            f"tool-draft:INVALID_MODEL_OUTPUT:{message.removeprefix(prefix)}", diagnostics=diagnostics
+        )
+    else:
+        error = DraftError("tool-draft:INVALID_MODEL_OUTPUT", diagnostics=diagnostics)
+    error.attempts = list(attempts or [])
+    return error
 
 
 class _DocumentContradiction(ValueError):
@@ -1982,6 +2320,8 @@ def normalize_draft_document(
     *,
     capability_goal: str,
     authoritative_delivery_requirements: dict | None = None,
+    intent_reading: dict | None = None,
+    known_boundaries: list[dict] | None = None,
 ) -> dict:
     """Validate model fields and compile delivery shape from the Core profile.
 
@@ -2024,16 +2364,27 @@ def normalize_draft_document(
         if authoritative_delivery_requirements is not None
         else document["delivery_requirements"]
     )
+    reading: dict = intent_reading if isinstance(intent_reading, dict) else {}
+    if authoritative_delivery_requirements is None and reading:
+        # The user's request already told Core what the tool must reach; an
+        # offline draft against a public_service source is a downgrade to send
+        # back, not a topology to admit (incident-network-intent-silently-downgraded-*).
+        _reject_network_intent_downgrade(raw_requirements, reading.get("data_sources") or ())
+    if authoritative_delivery_requirements is None:
+        _reject_file_input_for_open_api(raw_requirements)
+        _reject_non_bundle_format_for_workspace(raw_requirements)
     try:
         _reject_delivery_shape_contradiction(document, raw_requirements)
         profile = select_product_delivery_profile(raw_requirements)
         requirements, artifact = profile.admit_requirements(raw_requirements)
     except ProductProfileError as exc:
         raise DeliveryAdmissionError(f"tool-draft:{exc}") from exc
+    if reading and not is_workspace_profile(profile.profile_id):
+        _reject_text_only_profile_for_visual_deliverables(reading.get("deliverables") or ())
     workspace_contract: WorkspaceArtifactContractV1 | None = None
     fixture_builder: str | None = None
     fixture_blueprints: tuple[dict[str, Any], ...] = ()
-    if profile.profile_id == WORKSPACE_BUNDLE_PROFILE_ID:
+    if is_workspace_profile(profile.profile_id):
         if document.get("output_required_fields"):
             raise _projection_error(
                 "WORKSPACE_REQUIRED_FIELDS_NOT_SUPPORTED",
@@ -2045,6 +2396,12 @@ def normalize_draft_document(
             _compile_workspace_runtime_closure(document.get("workspace_contract"))
         )
         _reject_smoke_non_member_argument(compiled_contract)
+        _reject_open_api_without_hosts(raw_requirements, compiled_contract)
+        _reject_placeholder_open_api_hosts(raw_requirements, compiled_contract)
+        _reject_host_proven_unusable(raw_requirements, compiled_contract, known_boundaries)
+        if reading:
+            compiled_rules = compiled_contract.get("rules") if isinstance(compiled_contract, dict) else None
+            _reject_uncontracted_deliverables(compiled_rules, reading.get("deliverables") or ())
         try:
             workspace_contract = WorkspaceArtifactContractV1.model_validate(compiled_contract)
         except ValueError as exc:
@@ -2066,6 +2423,12 @@ def normalize_draft_document(
             document,
             input_kind=requirements.inputs[0].kind,
         )
+        _reject_fixture_set_without_live_anchor(raw_requirements, fixture_blueprints)
+        _reject_known_boundary_reuse(known_boundaries, fixture_blueprints)
+        _reject_unproven_paths_on_walled_hosts(
+            known_boundaries, recorded_request_keys(fixture_blueprints or ()), loc=("fixture_blueprints",)
+        )
+        _reject_known_boundary_reuse_in_builder(known_boundaries, fixture_builder, fixture_blueprints)
     else:
         if document.get("workspace_contract") is not None:
             raise _projection_error(
@@ -2156,6 +2519,24 @@ _PROJECTION_REPAIR_INSTRUCTION = (
     "complete workspace_contract while preserving fixture_builder and "
     "fixture_blueprints byte-for-byte; for cli_v2, workspace_contract and "
     "fixture_builder must be null and fixture_blueprints empty. "
+    "Exception: when reason_code is NETWORK_INTENT_DOWNGRADED, delivery_requirements.network "
+    "itself is the defect — raise it to open_api and declare workspace_contract.open_api_hosts "
+    "(everything else in delivery_requirements stays); when reason_code is "
+    "DELIVERABLE_NOT_CONTRACTED, add the contract rule(s) that deliver the named deliverables "
+    "and list each deliverable name in that rule's satisfies (switching to the workspace "
+    "profile when the deliverable is not plain text); when reason_code is "
+    "OPEN_API_INPUT_MUST_BE_DIRECTORY, change delivery_requirements.inputs[0].kind to directory "
+    "(the configuration file lives inside that directory) and make every fixture blueprint a "
+    "directory; when reason_code is OUTPUT_FORMAT_ID_NOT_WORKSPACE_BUNDLE, set "
+    "delivery_requirements.outputs[0].format_id to workspace_bundle and keep the deliverable "
+    "kinds in workspace_contract rules; when reason_code is OPEN_API_HOSTS_MISSING, declare in "
+    "workspace_contract.open_api_hosts the lowercase public hosts the fixtures record and the "
+    "producer calls (the sealed run maps only those to the stub); when reason_code is "
+    "OPEN_API_LIVE_ANCHOR_MISSING, set live_anchor=true on exactly one fixture blueprint and "
+    "give it real, public identifiers that exist today — the one case where fixture_blueprints "
+    "may change; when reason_code is KNOWN_BOUNDARY_ENDPOINT_REUSED, a fixture still records an "
+    "endpoint the rehearsal proved unusable (see known_boundaries): change the producer's requests "
+    "and the blueprints' request rows to a usable endpoint (fixture_blueprints may change here too). "
     "public_validation_errors lists exactly which contract fields Core rejected "
     "(loc/type/msg); fix every listed field and leave the rest untouched."
 )
@@ -2166,6 +2547,8 @@ def _projection_repair_context(
     error: DraftProjectionError,
     *,
     authoritative_delivery_requirements: dict | None = None,
+    intent_reading: dict | None = None,
+    known_boundaries: list[dict] | None = None,
 ) -> dict:
     """Return the bounded machine facts needed for representation-only repair."""
 
@@ -2193,6 +2576,8 @@ def _projection_repair_context(
         selected_artifact = None
     return {
         "reason_code": str(error).removeprefix("tool-draft:"),
+        "intent_reading": deepcopy(intent_reading) if isinstance(intent_reading, dict) else None,
+        "known_boundaries": deepcopy(list(known_boundaries)) if known_boundaries else [],
         "public_validation_errors": public_validation_diagnostics(error),
         "preserve_delivery_requirements": preserved,
         "selected_artifact": selected_artifact,
@@ -2207,6 +2592,21 @@ def _projection_repair_context(
     }
 
 
+def _schema_rejection_rows(exc: BaseException) -> list[dict[str, str]]:
+    """``loc``/``type``/``msg`` of one jsonschema rejection, never the document."""
+
+    path = ".".join(str(part) for part in (getattr(exc, "absolute_path", None) or ())) or "<document>"
+    validator = str(getattr(exc, "validator", "") or "schema")[:60]
+    limit = getattr(exc, "validator_value", None)
+    instance = getattr(exc, "instance", None)
+    # jsonschema's own message quotes the instance (the whole rejected source);
+    # name the constraint and the measured size instead.
+    measured = (
+        f"got length {len(instance)}" if isinstance(instance, (str, list, dict)) else f"got {type(instance).__name__}"
+    )
+    return [{"loc": path, "type": validator, "msg": f"{validator} {limit!r} violated ({measured})"[:200]}]
+
+
 def normalize_verifier_document(document: dict) -> dict[str, str]:
     """Validate the isolated verifier response before it enters a draft bundle."""
 
@@ -2215,7 +2615,12 @@ def normalize_verifier_document(document: dict) -> dict[str, str]:
 
         jsonschema.validate(document, _VERIFIER_SCHEMA)
     except jsonschema.ValidationError as exc:
-        raise DraftError("semantic-verifier-draft:INVALID_DOCUMENT") from exc
+        # The constraint that refused the document travels with the code: a
+        # bare INVALID_DOCUMENT rolled three repairs back without saying the
+        # source had outgrown maxLength (incident-discrimination-probe-mutates-upstream-copies-*).
+        raise DraftError(
+            "semantic-verifier-draft:INVALID_DOCUMENT", diagnostics=_schema_rejection_rows(exc)
+        ) from exc
     source = str(document["semantic_verifier"])
     if not source.strip():
         raise DraftError("semantic-verifier-draft:EMPTY_SOURCE")
@@ -2472,6 +2877,643 @@ def _example_inputs_schema(context: dict, requested: int) -> dict[str, Any]:
     return schema
 
 
+# ---------------------------------------------------------------------------
+# Intent reading (m6.4).  Four journeys drafted network=offline and invented a
+# user-supplied "snapshot" for data the user never has; two narrowed a named
+# deliverable (an e-book, a visual card) into JSON or plain text
+# (incident-network-intent-silently-downgraded-*, incident-deliverable-silently-
+# narrowed-*).  Before the main draft, one narrow question reads the request:
+# where each piece of data lives and what the user asked to receive, each with
+# a quote from the request as evidence that Core verifies.  The main draft may
+# not be weaker than that reading.
+# ---------------------------------------------------------------------------
+_INTENT_READING_SYSTEM = (
+    "You read ONE user request for a local tool and answer STRICT JSON only with exactly "
+    "two keys. data_sources: every piece of data the tool needs, each with name, origin and "
+    "evidence. origin is user_local when the user says they already have it on their machine "
+    "(an export, a file, a folder, a spreadsheet they own), public_service when it lives on a "
+    "public service and must be read at invocation time (weather, rates, feeds, repositories, "
+    "posts, package indexes, quakes, calendars behind a subscription link), and pinned_library "
+    "when the pinned upstream library itself ships the data. deliverables: every artifact the "
+    "user asked to receive, each with name, form (html_page, dashboard_html, pdf, epub, ics, "
+    "svg, png, json, csv, markdown, text or other) and evidence. evidence is a verbatim quote "
+    "copied from the request (at most 60 characters): one contiguous span, or two or three "
+    "spans joined by … in the order the user wrote them; never paraphrase, never invent data the "
+    "user did not mention. A configuration the user will write (a list of names, thresholds, a "
+    "location) is not a data source. Read the request from the user's point of view: data the "
+    "user would otherwise have to fetch by hand is public_service, not user_local."
+)
+_DELIVERABLE_FORMS = (
+    "html_page", "dashboard_html", "pdf", "epub", "ics", "svg", "png", "json", "csv", "markdown", "text", "other",
+)
+_INTENT_READING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["data_sources", "deliverables"],
+    "properties": {
+        "data_sources": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "origin", "evidence"],
+                "properties": {
+                    "name": {"type": "string", "maxLength": 80},
+                    "origin": {"type": "string", "enum": ["user_local", "public_service", "pinned_library"]},
+                    "evidence": {"type": "string", "maxLength": 200},
+                },
+            },
+        },
+        "deliverables": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "form", "evidence"],
+                "properties": {
+                    "name": {"type": "string", "maxLength": 80},
+                    "form": {"type": "string", "enum": list(_DELIVERABLE_FORMS)},
+                    "evidence": {"type": "string", "maxLength": 200},
+                },
+            },
+        },
+    },
+}
+_INTENT_ORIGINS = ("user_local", "public_service", "pinned_library")
+_TEXT_ONLY_FORMS = frozenset({"json", "csv", "markdown", "text", "other"})
+_INTENT_READING_ATTEMPTS = 3
+
+
+_ELLIPSIS_RE = re.compile(r"(?:…|\.{3,})")
+
+
+def _quoted_from(evidence: str, capability_goal: str) -> bool:
+    """Every fragment of the evidence is the user's own words, in the user's order.
+
+    A quote may elide with … or ... between fragments (models cite discontinuous
+    spans that way and were refused three times for it,
+    incident-verbatim-quote-rejects-ellipsis-*); whitespace never counts.
+    """
+
+    squeeze = lambda text: "".join(str(text).split())  # noqa: E731 - whitespace never counts
+    haystack = squeeze(capability_goal)
+    fragments = [squeeze(part) for part in _ELLIPSIS_RE.split(str(evidence)) if squeeze(part)]
+    if not fragments:
+        return False
+    position = 0
+    for fragment in fragments:
+        found = haystack.find(fragment, position)
+        if found < 0:
+            return False
+        position = found + len(fragment)
+    return True
+
+
+def validate_data_sources(document: dict, *, capability_goal: str) -> tuple[dict, ...]:
+    rows = document.get("data_sources") if isinstance(document, dict) else None
+    admitted: list[dict] = []
+    for index, row in enumerate(rows if isinstance(rows, list) else []):
+        if not isinstance(row, dict):
+            raise _projection_error("DATA_SOURCE_INVALID", ("data_sources", index), "each data source is an object")
+        origin = str(row.get("origin") or "")
+        if origin not in _INTENT_ORIGINS:
+            raise _projection_error(
+                "DATA_SOURCE_INVALID", ("data_sources", index, "origin"), f"origin must be one of {_INTENT_ORIGINS}"
+            )
+        evidence = str(row.get("evidence") or "")
+        if not _quoted_from(evidence, capability_goal):
+            raise _projection_error(
+                "DATA_SOURCE_EVIDENCE_NOT_IN_REQUEST",
+                ("data_sources", index, "evidence"),
+                "evidence must be a verbatim quote from the user's request; the user never said this",
+            )
+        admitted.append({"name": str(row.get("name") or "")[:80], "origin": origin, "evidence": evidence[:200]})
+    return tuple(admitted)
+
+
+def validate_intent_reading(document: dict, *, capability_goal: str) -> dict:
+    """Core's admitted reading of the request: only quotes the user actually wrote count."""
+
+    sources = validate_data_sources(document, capability_goal=capability_goal)
+    rows = document.get("deliverables") if isinstance(document, dict) else None
+    deliverables: list[dict] = []
+    forms = set(_DELIVERABLE_FORMS)
+    for index, row in enumerate(rows if isinstance(rows, list) else []):
+        if not isinstance(row, dict):
+            raise _projection_error("DELIVERABLE_INVALID", ("deliverables", index), "each deliverable is an object")
+        form = str(row.get("form") or "")
+        if form not in forms:
+            raise _projection_error(
+                "DELIVERABLE_INVALID", ("deliverables", index, "form"), f"form must be one of {sorted(forms)}"
+            )
+        evidence = str(row.get("evidence") or "")
+        if not _quoted_from(evidence, capability_goal):
+            raise _projection_error(
+                "DELIVERABLE_EVIDENCE_NOT_IN_REQUEST",
+                ("deliverables", index, "evidence"),
+                "evidence must be a verbatim quote from the user's request; the user never asked for this",
+            )
+        name = str(row.get("name") or "").strip()[:80]
+        if not name:
+            raise _projection_error("DELIVERABLE_INVALID", ("deliverables", index, "name"), "name is required")
+        deliverables.append({"name": name, "form": form, "evidence": evidence[:200]})
+    return {"data_sources": list(sources), "deliverables": deliverables}
+
+
+def required_network_for(data_sources) -> str:
+    public = any(str((row or {}).get("origin")) == "public_service" for row in data_sources or ())
+    return "open_api" if public else "offline"
+
+
+def _reject_network_intent_downgrade(raw_requirements: dict, data_sources) -> None:
+    """A public_service source makes offline a downgrade, never a representation choice."""
+
+    needed = required_network_for(data_sources)
+    declared = str((raw_requirements or {}).get("network") or "offline")
+    if needed == "open_api" and declared == "offline":
+        named = ", ".join(
+            str(row.get("name") or "?") for row in data_sources if str(row.get("origin")) == "public_service"
+        )
+        raise _projection_error(
+            "NETWORK_INTENT_DOWNGRADED",
+            ("delivery_requirements", "network"),
+            f"the request needs data from a public service at invocation time ({named}); "
+            "declare network=open_api and fetch it through the declared hosts instead of asking the "
+            "user for a snapshot file",
+        )
+
+
+def _reject_non_bundle_format_for_workspace(raw_requirements: dict) -> None:
+    """A directory deliverable has exactly one format id; a guess is a representation error."""
+
+    outputs = (raw_requirements or {}).get("outputs") or []
+    first = outputs[0] if outputs and isinstance(outputs[0], dict) else {}
+    if str(first.get("kind") or "") == "directory" and str(first.get("format_id") or "") != "workspace_bundle":
+        raise _projection_error(
+            "OUTPUT_FORMAT_ID_NOT_WORKSPACE_BUNDLE",
+            ("delivery_requirements", "outputs", 0, "format_id"),
+            "a directory deliverable is the workspace bundle: set outputs[0].format_id=workspace_bundle "
+            "and express the page, chart or file kinds as workspace_contract rules",
+        )
+
+
+def _reject_file_input_for_open_api(raw_requirements: dict) -> None:
+    """Under open_api the input directory is a representation fact, repairable, not an admission verdict."""
+
+    if str((raw_requirements or {}).get("network") or "") != "open_api":
+        return
+    inputs = (raw_requirements or {}).get("inputs") or []
+    first = inputs[0] if inputs and isinstance(inputs[0], dict) else {}
+    if str(first.get("kind") or "") == "file":
+        raise _projection_error(
+            "OPEN_API_INPUT_MUST_BE_DIRECTORY",
+            ("delivery_requirements", "inputs", 0, "kind"),
+            "an open-API tool takes one local directory (the user's configuration file(s) inside it; "
+            "the Harness places __responses__ beside them): set inputs[0].kind=directory, keep the "
+            "configuration as a file inside that directory, and build directory fixtures",
+        )
+
+
+_PLACEHOLDER_TLDS = frozenset({"test", "example", "invalid", "localhost", "local"})
+_PLACEHOLDER_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def is_placeholder_host(host: str) -> bool:
+    """A host name that can never be a live public API: reserved TLDs, example domains, loopback, IP literals."""
+
+    name = str(host or "").strip().lower().rstrip(".")
+    if not name:
+        return True
+    if name.startswith("[") or ":" in name or _IPV4_RE.match(name):
+        return True
+    labels = name.split(".")
+    if len(labels) < 2 or labels[-1] in _PLACEHOLDER_TLDS:
+        return True
+    return any(name == domain or name.endswith("." + domain) for domain in _PLACEHOLDER_DOMAINS)
+
+
+def _reject_placeholder_open_api_hosts(raw_requirements: dict, compiled_contract: object) -> None:
+    """A declared host must be a real public host; synthetic data lives in recorded bodies, never in host names.
+
+    The replay stub records any name, so the self-check cannot tell; the
+    rehearsal reports HOST_UNREACHABLE and proposes checking the local network
+    — the last station, the wrong category, for a fact decidable here
+    (incident-placeholder-host-reaches-rehearsal-*).
+    """
+
+    if str((raw_requirements or {}).get("network") or "") != "open_api":
+        return
+    hosts = compiled_contract.get("open_api_hosts") if isinstance(compiled_contract, dict) else None
+    if not isinstance(hosts, list):
+        return
+    for index, host in enumerate(hosts):
+        if is_placeholder_host(str(host)):
+            raise _projection_error(
+                "OPEN_API_HOST_PLACEHOLDER",
+                ("workspace_contract", "open_api_hosts", index),
+                f"{str(host).strip()!r} is a placeholder name (reserved TLD, example domain, loopback or IP "
+                "literal), never a live public API; declare only real public hosts the user can reach — "
+                "scenario variation belongs in the recorded response bodies, not in invented hosts",
+            )
+
+
+def _reject_host_proven_unusable(raw_requirements: dict, compiled_contract: object, known_boundaries) -> None:
+    """A host whose every probed endpoint was a wall, and which never answered, is not declared again.
+
+    Two invented paths on the same host each cost a whole journey (draft,
+    self-check, freeze, rehearsal) while another declared host answered 200
+    every time.  The facts were on disk; the drafting station did not say them
+    (incident-endpoint-guessing-on-a-proven-unusable-host-*).
+    """
+
+    if str((raw_requirements or {}).get("network") or "") != "open_api":
+        return
+    hosts = compiled_contract.get("open_api_hosts") if isinstance(compiled_contract, dict) else None
+    if not isinstance(hosts, list) or not known_boundaries:
+        return
+    walls: dict[str, dict[str, str]] = {}
+    answered: set[str] = set()
+    for row in known_boundaries:
+        if not isinstance(row, dict):
+            continue
+        host = str(row.get("host") or "").strip().lower()
+        path = "/" + str(row.get("path") or "").strip().lstrip("/")
+        code = str(row.get("code") or "")
+        if code == "OK":
+            answered.add(host)
+        elif code in BLOCKING_BOUNDARY_CODES:
+            walls.setdefault(host, {}).setdefault(path, code)
+    for index, declared in enumerate(hosts):
+        host = str(declared).strip().lower()
+        proven = walls.get(host) or {}
+        if len(proven) < 2 or host in answered:
+            continue
+        wall_text = ", ".join(f"{path} ({code})" for path, code in sorted(proven.items()))
+        live = sorted(answered - {host})
+        raise _projection_error(
+            "OPEN_API_HOST_PROVEN_UNUSABLE",
+            ("workspace_contract", "open_api_hosts", index),
+            f"{host}: every endpoint tried on this host was a wall — {wall_text} — and no GET on it has ever "
+            "answered; do not invent another path on it. Drop the host and derive the same facts from a host "
+            "that has answered"
+            + (f" ({', '.join(live)})" if live else "")
+            + ", or state the boundary to the user",
+        )
+
+
+def _reject_open_api_without_hosts(raw_requirements: dict, compiled_contract: object) -> None:
+    """Under open_api the host list is a representation fact, repairable at drafting.
+
+    Readiness already refuses to freeze an open-API draft without hosts; a draft
+    that reaches the self-check with none runs its producer against a stub that
+    maps nothing, and every round ends in the same URLError far from the cause
+    (incident-open-api-hosts-empty-selfcheck-blind-*).
+    """
+
+    if str((raw_requirements or {}).get("network") or "") != "open_api":
+        return
+    hosts = compiled_contract.get("open_api_hosts") if isinstance(compiled_contract, dict) else None
+    if not isinstance(hosts, list) or not any(str(item).strip() for item in hosts):
+        raise _projection_error(
+            "OPEN_API_HOSTS_MISSING",
+            ("workspace_contract", "open_api_hosts"),
+            "an open-API tool declares the lowercase public hosts its producer calls and its "
+            "fixtures record; the sealed run maps only those hosts to the replay stub, so an empty "
+            "list means every request fails — declare them even when the user's configuration "
+            "supplies the URLs",
+        )
+
+
+def _reject_fixture_set_without_live_anchor(raw_requirements: dict, blueprints) -> None:
+    """An open-API fixture set names one real resource the rehearsal can ask the world about."""
+
+    if str((raw_requirements or {}).get("network") or "") != "open_api":
+        return
+    if any(bool(dict(item).get("live_anchor")) for item in blueprints or ()):
+        return
+    raise _projection_error(
+        "OPEN_API_LIVE_ANCHOR_MISSING",
+        ("fixture_blueprints",),
+        "fixture identifiers are invented by design, so the rehearsal cannot tell a gone endpoint "
+        "from a resource that never existed; set live_anchor=true on exactly one blueprint whose "
+        "identifiers are real, public and exist today (for example the upstream repository)",
+    )
+
+
+_BLOCKING_BOUNDARY_CODES = BLOCKING_BOUNDARY_CODES
+
+
+def _reject_known_boundary_reuse(known_boundaries, blueprints) -> None:
+    """A redraft after a rehearsal boundary may not record the endpoint that boundary named.
+
+    The proposal「改用免凭证公共端点重新起草」had no path into the next draft, so
+    the model guessed the same endpoint again
+    (incident-boundary-proposal-has-no-retry-path-*).  Credentials and gone
+    endpoints are walls; a drifted shape is a fact the rules teach, not a wall.
+    """
+
+    blocked = {
+        (str(row.get("host") or "").strip().lower(), "/" + str(row.get("path") or "").strip().lstrip("/"))
+        for row in (known_boundaries or ())
+        if isinstance(row, dict) and str(row.get("code") or "") in _BLOCKING_BOUNDARY_CODES
+    }
+    if not blocked:
+        return
+    for key in recorded_request_keys(blueprints or ()):
+        target = key.split(" ", 1)[1].split("?", 1)[0]
+        for host, path in blocked:
+            if target == f"{host}{path}":
+                raise _projection_error(
+                    "KNOWN_BOUNDARY_ENDPOINT_REUSED",
+                    ("fixture_blueprints",),
+                    f"the rehearsal proved GET {host}{path} unusable without credentials or gone; "
+                    "a fixture still records it — request a usable endpoint instead",
+                )
+
+
+def _path_segments(path: str) -> tuple[str, ...]:
+    return tuple(part for part in str(path or "").strip().split("/") if part)
+
+
+def _path_is_proven(path: str, proven: set[str]) -> bool:
+    """Exact match, or a template the observations already vary: ``/pypi/a/json`` and
+    ``/pypi/b/json`` prove ``/pypi/c/json``; one observation proves only itself."""
+
+    if path in proven:
+        return True
+    segments = _path_segments(path)
+    group = [_path_segments(item) for item in proven]
+    group = [item for item in group if len(item) == len(segments)]
+    if not group:
+        return False
+    variable = {
+        index for index in range(len(segments)) if len({item[index] for item in group}) >= 2
+    }
+    return any(
+        all(segments[index] == item[index] or index in variable for index in range(len(segments)))
+        for item in group
+    )
+
+
+def _reject_unproven_paths_on_walled_hosts(known_boundaries, keys, *, loc: tuple[object, ...]) -> None:
+    """On a host with a wall history, a recorded path must belong to a family that has answered.
+
+    Four invented paths on one host, each proven gone by a full journey, while
+    the paths that had answered were on disk all along.  A wall history turns
+    a host's surface from something to explore into something to prove: the
+    exact path, or a template the observations already vary, must have
+    answered OK before; the rehearsal proves first-time hosts
+    (incident-endpoint-guessing-on-a-walled-host-*).
+    """
+
+    walls: dict[str, dict[str, str]] = {}
+    proven_paths: dict[str, set[str]] = {}
+    for row in known_boundaries or ():
+        if not isinstance(row, dict):
+            continue
+        host = str(row.get("host") or "").strip().lower()
+        path = "/" + str(row.get("path") or "").strip().lstrip("/")
+        code = str(row.get("code") or "")
+        if not host:
+            continue
+        if code == "OK":
+            proven_paths.setdefault(host, set()).add(path)
+        elif code in BLOCKING_BOUNDARY_CODES:
+            walls.setdefault(host, {}).setdefault(path, code)
+    if not walls:
+        return
+    for key in keys or ():
+        target = str(key).split(" ", 1)[-1].split("?", 1)[0]
+        host, _sep, rest = target.partition("/")
+        host = host.strip().lower()
+        path = "/" + rest
+        if host not in walls:
+            continue
+        proven = proven_paths.get(host, set())
+        if _path_is_proven(path, proven):
+            continue
+        wall_text = ", ".join(f"{p} ({c})" for p, c in sorted(walls[host].items()))
+        families = sorted(proven) or ["none"]
+        raise _projection_error(
+            "OPEN_API_PATH_UNPROVEN_ON_WALLED_HOST",
+            loc,
+            f"{host} has proven walls — {wall_text} — and the draft records {path}, a path never observed "
+            f"on it; on a host with walls only paths that have answered may be recorded (proven paths: "
+            f"{', '.join(families)}; a template is proven where those observations vary). Do not invent "
+            "paths: use a proven path or template, or a host that answered, or state the boundary to the user",
+        )
+
+
+def _reject_known_boundary_reuse_in_builder(known_boundaries, builder_source, blueprints) -> None:
+    """The same wall, checked on what the builder's *code* records.
+
+    Blueprint rows are one way to record a request; builder code that assembles
+    the keys is the other, and the row-level gate cannot see it.  The self-check
+    catches it later — and hands it to owners who cannot change the design
+    (incident-known-boundary-reused-by-builder-code-*).  So the first
+    blueprint is materialised here, with the host interpreter, and its manifest
+    keys are held against the walls; a builder that cannot run is left to the
+    self-check, which names that failure itself.
+    """
+
+    import sys
+    import tempfile
+
+    from repoproof.adoption.intake.workspace_fixtures import (
+        blocked_boundary_endpoints,
+        build_fixture_candidate,
+        manifest_request_keys,
+    )
+
+    blocked = blocked_boundary_endpoints(known_boundaries)
+    source = str(builder_source or "")
+    if not blocked or not source.strip() or not blueprints:
+        return
+    first = blueprints[0]
+    blueprint = first if isinstance(first, FixtureBlueprintV1) else FixtureBlueprintV1.model_validate(first)
+    with tempfile.TemporaryDirectory(prefix="repoproof-boundary-probe-") as temp:
+        builder_path = Path(temp) / "fixture_builder.py"
+        builder_path.write_text(source, encoding="utf-8")
+        try:
+            candidate = build_fixture_candidate(
+                blueprint=blueprint,
+                builder_id="projection-boundary-probe",
+                builder_source=builder_path,
+                fixture_root=Path(temp) / "root",
+                python_exe=sys.executable,
+                isolation_required=False,
+            )
+        except Exception:  # noqa: BLE001 - a builder that cannot run has its own failure path
+            return
+        keys = manifest_request_keys(Path(candidate.fixture_path))
+    for key in keys:
+        target = key.split(" ", 1)[1].split("?", 1)[0]
+        for (host, path), code in blocked.items():
+            if target == f"{host}{path}":
+                raise _projection_error(
+                    "KNOWN_BOUNDARY_ENDPOINT_REUSED",
+                    ("fixture_builder",),
+                    f"the rehearsal proved GET {host}{path} {code}; the builder's code still records it "
+                    "— change the design: record (and have the producer call) a usable GET endpoint, "
+                    "on this host or another declared host",
+                )
+    _reject_unproven_paths_on_walled_hosts(known_boundaries, keys, loc=("fixture_builder",))
+
+
+def _reject_uncontracted_deliverables(rules, deliverables) -> None:
+    """Every user-named deliverable is satisfied by at least one contract rule that says so."""
+
+    satisfied: set[str] = set()
+    for rule in rules or ():
+        if isinstance(rule, dict):
+            satisfied.update(str(item).strip() for item in (rule.get("satisfies") or ()) if str(item).strip())
+    missing = [str(row.get("name") or "") for row in deliverables or () if str(row.get("name") or "") not in satisfied]
+    if missing:
+        raise _projection_error(
+            "DELIVERABLE_NOT_CONTRACTED",
+            ("workspace_contract", "rules"),
+            "the user asked for deliverables no contract rule satisfies: "
+            + ", ".join(missing)
+            + "; add the file rule(s) that deliver them and list the deliverable name in that rule's satisfies",
+        )
+
+
+def _reject_text_only_profile_for_visual_deliverables(deliverables) -> None:
+    visual = [
+        f"{row.get('name')} ({row.get('form')})"
+        for row in deliverables or ()
+        if str(row.get("form")) not in _TEXT_ONLY_FORMS
+    ]
+    if visual:
+        raise _projection_error(
+            "DELIVERABLE_NOT_CONTRACTED",
+            ("delivery_requirements", "outputs", 0, "kind"),
+            "the user asked for non-text deliverables (" + ", ".join(visual) + "); deliver a workspace "
+            "directory (outputs[0].kind=directory, format_id=workspace_bundle) whose contract rules satisfy them",
+        )
+
+
+def _document_from_text(text: str) -> dict:
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.strip("`\n")
+        body = body[body.index("{"):]
+    return json.loads(body[body.index("{"): body.rindex("}") + 1])
+
+
+def read_intent(drafter, capability_goal: str) -> dict:
+    """One narrow model question, verified by Core, before the main draft is asked."""
+
+    context: dict = {"capability_goal": capability_goal}
+    last: DraftProjectionError | None = None
+    attempts: list[dict] = []
+    for _attempt in range(_INTENT_READING_ATTEMPTS):
+        structured = getattr(drafter, "_structured", None)
+        if callable(structured):
+            document = structured(
+                instructions=_INTENT_READING_SYSTEM,
+                context=context,
+                schema=_INTENT_READING_SCHEMA,
+                purpose="intent-reading",
+            )
+        else:
+            text = drafter._once_with_system(
+                _INTENT_READING_SYSTEM,
+                json.dumps(context, ensure_ascii=False),
+                schema=_INTENT_READING_SCHEMA,
+                schema_name="intent_reading",
+            )
+            try:
+                document = _document_from_text(text)
+            except ValueError as exc:
+                raise DraftError("tool-draft:INTENT_READING_NOT_JSON") from exc
+        try:
+            return validate_intent_reading(document, capability_goal=capability_goal)
+        except DraftProjectionError as exc:
+            last = exc
+            attempts.append(
+                {
+                    "attempt": _attempt + 1,
+                    "reason_code": str(exc).removeprefix("tool-draft:"),
+                    "public_validation_errors": public_validation_diagnostics(exc),
+                    "document": deepcopy(document),
+                }
+            )
+            context = {
+                "capability_goal": capability_goal,
+                "core_projection_repair": {
+                    "reason_code": str(exc).removeprefix("tool-draft:"),
+                    "public_validation_errors": public_validation_diagnostics(exc),
+                    "previous_reading": document,
+                },
+            }
+    # The terminal carries the last rejection: which rule, which field, how
+    # many attempts — never the model's input values.  A bare code left a
+    # 22-second journey undiagnosable from disk
+    # (incident-intent-reading-terminal-without-diagnostics-*).
+    rows: list[dict[str, str]] = []
+    if last is not None:
+        rows.append(
+            {
+                "loc": "intent_reading",
+                "type": str(last).removeprefix("tool-draft:").lower(),
+                "msg": (
+                    f"Core rejected every one of {_INTENT_READING_ATTEMPTS} readings; the last rejection "
+                    f"was {str(last).removeprefix('tool-draft:')}"
+                ),
+            }
+        )
+        rows.extend(public_validation_diagnostics(last))
+    error = DraftError("tool-draft:INTENT_READING_INVALID", diagnostics=rows)
+    # The rejected readings themselves stay with the draft for forensics: the
+    # public rows never carry the model's values, so without them nobody can
+    # tell a punctuation mismatch from a rewritten quote
+    # (incident-intent-reading-rejected-document-not-persisted-*).
+    error.attempts = attempts
+    error.capability_goal = capability_goal
+    raise error from last
+
+
+def persist_intent_reading_attempts(draft_dir: Path, error: BaseException) -> Path | None:
+    """Write the rejected readings beside the draft; None when the error carries none."""
+
+    attempts = getattr(error, "attempts", None)
+    if not attempts:
+        return None
+    path = Path(draft_dir) / "intent_reading_attempts.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capability_goal": str(getattr(error, "capability_goal", "") or ""),
+                "attempts": list(attempts),
+            },
+            ensure_ascii=False,
+            indent=1,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def persist_draft_projection_attempts(draft_dir: Path, error: BaseException) -> Path | None:
+    """Write the documents Core refused during drafting beside the draft; None when there are none."""
+
+    attempts = getattr(error, "attempts", None)
+    if not attempts:
+        return None
+    path = Path(draft_dir) / "draft_projection_attempts.json"
+    path.write_text(
+        json.dumps({"schema_version": 1, "attempts": list(attempts)}, ensure_ascii=False, indent=1) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 class CodexDrafter:
     """Subscription-backed, no-tool drafter for all Studio assistant actions."""
 
@@ -2515,17 +3557,19 @@ class CodexDrafter:
         self.last_usage = dict(result.usage)
         return result.document
 
+    def read_intent(self, capability_goal: str) -> dict:
+        return read_intent(self, capability_goal)
+
     def draft(self, context: dict) -> dict:
         structured_context = _context_with_product_profile(context)
         authoritative = context.get("authoritative_delivery_requirements")
         instructions = _CODEX_DRAFT_SYSTEM
         if authoritative is not None:
             instructions += "\n" + _CONFIRMED_DELIVERY_INSTRUCTION
-        schema = _schema_with_pinned_input_kind(
-            _CODEX_DRAFT_SCHEMA, _context_input_kind(context)
-        )
+        schema = _draft_schema_for(context, _CODEX_DRAFT_SCHEMA)
         seen: set[tuple[str, str]] = set()
         stalled = 0
+        attempts: list[dict] = []
         for attempt in range(1, _MAX_PROJECTION_REPAIR_ATTEMPTS + 2):
             document = self._structured(
                 instructions=instructions,
@@ -2538,24 +3582,47 @@ class CodexDrafter:
                     document,
                     capability_goal=str(context.get("capability_goal") or ""),
                     authoritative_delivery_requirements=authoritative,
+                    intent_reading=context.get("intent_reading"),
+                    known_boundaries=context.get("known_boundaries"),
                 )
-            except DeliveryAdmissionError:
+            except DeliveryAdmissionError as exc:
+                # Never repaired, but still the only record of what the model
+                # wrote (incident-admission-rejected-document-not-persisted-*).
+                exc.attempts = [
+                    *attempts,
+                    {
+                        "attempt": attempt,
+                        "reason_code": str(exc).removeprefix("tool-draft:"),
+                        "public_validation_errors": public_validation_diagnostics(exc),
+                        "document": deepcopy(document),
+                    },
+                ]
                 raise
             except DraftProjectionError as exc:
                 stalled = _projection_repair_stall(
                     _projection_rejection_signature(exc), seen, stalled
                 )
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "reason_code": str(exc).removeprefix("tool-draft:"),
+                        "public_validation_errors": public_validation_diagnostics(exc),
+                        "document": deepcopy(document),
+                    }
+                )
                 if (
                     stalled >= _PROJECTION_REPAIR_STALL_BUDGET
                     or attempt > _MAX_PROJECTION_REPAIR_ATTEMPTS
                 ):
-                    raise _invalid_model_output_error(exc) from exc
+                    raise _invalid_model_output_error(exc, attempts=attempts) from exc
                 structured_context = {
                     **_context_with_product_profile(context),
                     "core_projection_repair": _projection_repair_context(
                         document,
                         exc,
                         authoritative_delivery_requirements=authoritative,
+                        intent_reading=context.get("intent_reading"),
+                        known_boundaries=context.get("known_boundaries"),
                     ),
                 }
                 instructions = _CODEX_DRAFT_SYSTEM + "\n" + _PROJECTION_REPAIR_INSTRUCTION
@@ -2938,6 +4005,9 @@ class LiteLLMDrafter:
             schema_name="tool_draft",
         )
 
+    def read_intent(self, capability_goal: str) -> dict:
+        return read_intent(self, capability_goal)
+
     def draft(self, context: dict) -> dict:
         user_msg = json.dumps(
             _context_with_product_profile(context), ensure_ascii=False, indent=1
@@ -2946,7 +4016,7 @@ class LiteLLMDrafter:
         system = _SYSTEM
         if authoritative is not None:
             system += "\n" + _CONFIRMED_DELIVERY_INSTRUCTION
-        schema = _schema_with_pinned_input_kind(_DRAFT_SCHEMA, _context_input_kind(context))
+        schema = _draft_schema_for(context, _DRAFT_SCHEMA)
         text = self._once_with_system(
             system,
             user_msg,
@@ -2955,6 +4025,7 @@ class LiteLLMDrafter:
         )
         seen: set[tuple[str, str]] = set()
         stalled = 0
+        attempts: list[dict] = []
         for attempt in range(1, _MAX_PROJECTION_REPAIR_ATTEMPTS + 2):
             try:
                 body = text.strip()
@@ -2966,24 +4037,46 @@ class LiteLLMDrafter:
                     document,
                     capability_goal=str(context.get("capability_goal") or ""),
                     authoritative_delivery_requirements=authoritative,
+                    intent_reading=context.get("intent_reading"),
+                    known_boundaries=context.get("known_boundaries"),
                 )
-            except DeliveryAdmissionError:
+            except DeliveryAdmissionError as exc:
                 # A well-formed but unsupported topology is an admission result,
-                # not bad model syntax.  Never ask the model to make it disappear.
+                # not bad model syntax.  Never ask the model to make it disappear
+                # — but keep what it wrote (incident-admission-rejected-document-not-persisted-*).
+                exc.attempts = [
+                    *attempts,
+                    {
+                        "attempt": attempt,
+                        "reason_code": str(exc).removeprefix("tool-draft:"),
+                        "public_validation_errors": public_validation_diagnostics(exc),
+                        "document": deepcopy(document),
+                    },
+                ]
                 raise
             except DraftProjectionError as exc:
                 stalled = _projection_repair_stall(
                     _projection_rejection_signature(exc), seen, stalled
                 )
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "reason_code": str(exc).removeprefix("tool-draft:"),
+                        "public_validation_errors": public_validation_diagnostics(exc),
+                        "document": deepcopy(document),
+                    }
+                )
                 if (
                     stalled >= _PROJECTION_REPAIR_STALL_BUDGET
                     or attempt > _MAX_PROJECTION_REPAIR_ATTEMPTS
                 ):
-                    raise _invalid_model_output_error(exc) from exc
+                    raise _invalid_model_output_error(exc, attempts=attempts) from exc
                 repair_context = _projection_repair_context(
                     document,
                     exc,
                     authoritative_delivery_requirements=authoritative,
+                    intent_reading=context.get("intent_reading"),
+                    known_boundaries=context.get("known_boundaries"),
                 )
                 text = self._once_with_system(
                     system,
@@ -3568,6 +4661,47 @@ def _drafter_context(report_like: dict) -> dict:
     }
 
 
+def recorded_request_keys(blueprints) -> list[str]:
+    """The GET keys a fixture records, read from request rows in blueprint parameters.
+
+    A request row is any object carrying ``host`` and ``path``; its query is a
+    mapping or string, canonicalised the way the replay stub matches.  This is
+    public fixture fact the judge must be told
+    (incident-verifier-not-told-the-recorded-requests-*).
+    """
+
+    from repoproof.execution.open_api_replay import canonical_query
+
+    keys: set[str] = set()
+
+    def _walk(value) -> None:
+        if isinstance(value, dict):
+            if "host" in value and "path" in value:
+                host = str(value.get("host") or "").strip().lower()
+                path = "/" + str(value.get("path") or "").strip().lstrip("/")
+                raw = value.get("query")
+                if isinstance(raw, dict):
+                    from urllib.parse import urlencode
+
+                    query = canonical_query(urlencode({str(k): str(v) for k, v in raw.items()}))
+                else:
+                    query = canonical_query(str(raw or ""))
+                if host:
+                    keys.add(f"GET {host}{path}" + (f"?{query}" if query else ""))
+            for child in value.values():
+                _walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                _walk(child)
+
+    for blueprint in blueprints or ():
+        parameters = (
+            blueprint.get("parameters") if isinstance(blueprint, dict) else getattr(blueprint, "parameters", None)
+        )
+        _walk(parameters)
+    return sorted(keys)
+
+
 def _verifier_context(public_upstream: dict, drafted: dict) -> dict:
     """Build an allowlisted, pre-confirmation context for independent judgement.
 
@@ -3600,6 +4734,7 @@ def _verifier_context(public_upstream: dict, drafted: dict) -> dict:
         validation_profile_spec = public_validation_profile_spec(
             output_contract.get("validation_profile")
         )
+    recorded = recorded_request_keys(drafted.get("fixture_blueprints") or ())
     return {
         "capability_goal": str(public_upstream.get("capability_goal") or ""),
         "semantic_commitments": deepcopy(drafted["semantic_commitments"]),
@@ -3612,6 +4747,9 @@ def _verifier_context(public_upstream: dict, drafted: dict) -> dict:
         "output_contract": output_contract,
         "workspace_contract": workspace_contract,
         "output_validation_profile_spec": validation_profile_spec,
+        # Public fixture fact: which GET keys the recordings hold.  Absent for
+        # offline drafts so their allowlisted context stays exactly as before.
+        **({"recorded_requests": recorded} if recorded else {}),
         "upstream_public_info": {
             key: deepcopy(public_upstream.get(key)) for key in upstream_keys
         },
@@ -3624,6 +4762,7 @@ def draft_into_bundle(
     drafter,
     *,
     authoritative_delivery_requirements: dict | None = None,
+    known_boundaries: list[dict] | None = None,
 ) -> dict:
     """起草并写回 draft 束;返回 {fields_drafted, skipped, meta_path}。"""
     draft_dir = Path(draft_dir)
@@ -3647,7 +4786,35 @@ def draft_into_bundle(
         public_context["authoritative_delivery_requirements"] = (
             admitted.model_dump(mode="json")
         )
-    drafted = drafter.draft(public_context)
+    # One narrow question first: where the data lives and what the user asked
+    # to receive, with quotes Core verifies.  The main draft may not be weaker
+    # than this reading (incident-network-intent-silently-downgraded-*).
+    if known_boundaries:
+        # Facts a rehearsal found against today's real hosts; the draft must
+        # route around them, and they stay on disk beside the draft.
+        rows = [dict(row) for row in known_boundaries if isinstance(row, dict)]
+        public_context["known_boundaries"] = deepcopy(rows)
+        (draft_dir / "known_boundaries.json").write_text(
+            json.dumps({"schema_version": 1, "boundaries": rows}, ensure_ascii=False, indent=1) + "\n",
+            encoding="utf-8",
+        )
+    intent_reading: dict | None = None
+    intent_usage: dict = {}
+    capability_goal = str(public_context.get("capability_goal") or "").strip()
+    reader = getattr(drafter, "read_intent", None)
+    if capability_goal and callable(reader):
+        try:
+            intent_reading = reader(capability_goal)
+        except DraftError as exc:
+            persist_intent_reading_attempts(draft_dir, exc)
+            raise
+        intent_usage = deepcopy(getattr(drafter, "last_usage", {}))
+        public_context["intent_reading"] = intent_reading
+    try:
+        drafted = drafter.draft(public_context)
+    except DraftError as exc:
+        persist_draft_projection_attempts(draft_dir, exc)
+        raise
     # A current Product draft may not smuggle its judge out of the same model
     # response that produced the reference implementation.  Requiring a second
     # method is a provenance boundary, not a prompt convention.
@@ -3666,10 +4833,10 @@ def draft_into_bundle(
     ]
     required_keys.append(
         "workspace_contract"
-        if drafted.get("delivery_profile") == WORKSPACE_BUNDLE_PROFILE_ID
+        if is_workspace_profile(drafted.get("delivery_profile"))
         else "output_contract"
     )
-    if drafted.get("delivery_profile") == WORKSPACE_BUNDLE_PROFILE_ID:
+    if is_workspace_profile(drafted.get("delivery_profile")):
         required_keys.extend(["fixture_builder", "fixture_blueprints"])
     missing = [
         key for key in required_keys if not str(drafted.get(key) or "").strip()
@@ -3698,14 +4865,16 @@ def draft_into_bundle(
         "schema_version": 1,
         "profile_id": profile.profile_id,
     }
+    if intent_reading is not None:
+        doc["_intent_reading"] = deepcopy(intent_reading)
     fixture_assets_created: list[str] = []
     tool_doc = doc.setdefault("tool", {})
     interface = tool_doc.setdefault("interface", {})
     interface.setdefault("input", {})["kind"] = requirements.inputs[0].kind
     tool_name = str(tool_doc.get("name") or "tool")
-    if profile.profile_id == WORKSPACE_BUNDLE_PROFILE_ID:
+    if is_workspace_profile(profile.profile_id):
         tool_doc["schema_version"] = 4
-        tool_doc["delivery_profile_id"] = WORKSPACE_BUNDLE_PROFILE_ID
+        tool_doc["delivery_profile_id"] = profile.profile_id
         tool_doc["workspace_contract"] = deepcopy(drafted["workspace_contract"])
         interface["usage"] = f"{tool_name} <input> --out-dir <new-directory>"
         interface["output"] = {
@@ -3848,7 +5017,7 @@ def draft_into_bundle(
     if suggestions:
         ex_p = draft_dir / (
             WORKSPACE_EXAMPLES_YAML
-            if profile.profile_id == WORKSPACE_BUNDLE_PROFILE_ID
+            if is_workspace_profile(profile.profile_id)
             else EXAMPLES_YAML
         )
         lines = ["# 起草层建议(仅建议;真值文件归人放置):",
@@ -3864,6 +5033,7 @@ def draft_into_bundle(
         "drafter": getattr(drafter, "name", type(drafter).__name__),
         "usage": getattr(drafter, "last_usage", {}),
         "usage_by_stage": {
+            **({"intent_reading": intent_usage} if intent_reading is not None else {}),
             "proposal_and_reference": proposal_usage,
             "semantic_verifier": verifier_usage,
         },

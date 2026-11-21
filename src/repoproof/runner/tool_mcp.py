@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from repoproof.adoption.assembly.output_contract import mcp_output_projection
+from repoproof.domain.models import is_workspace_profile
 from repoproof.runner.tool_paths import (
     TOOL_NAME_PATTERN,
     ToolPathError,
@@ -718,7 +719,7 @@ def _write_mcp_server_install_locked(tool_dir: Path, release_root: Path) -> Path
     manifest = json.loads((tool_dir / "tool.json").read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise RuntimeError("tool manifest 必须为 JSON object")
-    if manifest.get("delivery_profile_id") == "workspace_bundle_v1":
+    if is_workspace_profile(manifest.get("delivery_profile_id")):
         # M6.2 deliberately keeps directory delivery on the CLI/UI path.  A
         # future MCP projection must define directory transport semantics; it
         # must not silently reuse the single-file/stdout adapter.

@@ -193,10 +193,6 @@ def test_intake_rejects_credentialled_irreversible_intent_before_repository_acce
     ("goal", "reason_code"),
     [
         (
-            "从在线 API 下载最新记录并生成本地报告。",
-            "UNSUPPORTED_RUNTIME_NETWORK_REQUIRED",
-        ),
-        (
             "持续监控本地实验目录，有新文件就生成摘要。",
             "UNSUPPORTED_LONG_RUNNING_LIFECYCLE",
         ),
@@ -209,6 +205,10 @@ def test_intake_rejects_credentialled_irreversible_intent_before_repository_acce
 def test_explicit_delivery_topology_stops_before_repository_access(
     tmp_path, monkeypatch, goal: str, reason_code: str
 ) -> None:
+    """A soft boundary (long-running) now stops with NEED_REFRAME instead of
+    UNSUPPORTED (m6.4 reframe); either way nothing is cloned.  Reading a public
+    API stopped being a boundary altogether (open_api_workspace_v1), so that row
+    lives in test_public_api_reading_is_admitted_by_the_intent_gate."""
     def forbidden_repository_access(*_args, **_kwargs):
         raise AssertionError("repository access must not occur for rejected intent")
 
@@ -223,9 +223,15 @@ def test_explicit_delivery_topology_stops_before_repository_access(
         revision="v1",
     )
 
-    assert report.admission.status == "UNSUPPORTED"
+    assert report.admission.status in {"UNSUPPORTED", "NEED_REFRAME"}
     assert report.admission.reason_codes == [reason_code]
     assert report.draft == {}
+
+
+def test_public_api_reading_is_admitted_by_the_intent_gate() -> None:
+    from repoproof.adoption.admission.admission_report import decide_tool_intent
+
+    assert decide_tool_intent("从在线 API 下载最新记录并生成本地报告。") is None
 
 
 # ------------------------------------------------------------ 草稿与缺口

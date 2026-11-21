@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -26,7 +28,7 @@ from repoproof.adoption.delivery.portable_workspace_runtime import (
     seal_offline_python_runtime,
 )
 from repoproof.adoption.intake.upstream_pin import normalize_dist_name
-from repoproof.domain.models import TaskPackageManifest, WorkspaceArtifactContractV1
+from repoproof.domain.models import TaskPackageManifest, WorkspaceArtifactContractV1, is_workspace_profile
 from repoproof.execution.workspace_bundle import (
     build_artifact_manifest,
     manifest_divergence,
@@ -160,6 +162,55 @@ if result is not None:
 """.strip()
 
 
+
+@dataclass(frozen=True)
+class _ReferenceExecution:
+    process: subprocess.CompletedProcess
+    session_codes: list[str]
+    session_details: list[str]
+
+
+def _execute_workspace_reference(
+    *,
+    python: str,
+    runner: Path,
+    reference: Path,
+    input_path: Path,
+    reference_output: Path,
+    open_api_hosts: tuple[str, ...],
+    stage_dir: Path,
+) -> _ReferenceExecution:
+    """Run the frozen workspace reference the way every other managed run does.
+
+    A recorded example (one with ``__responses__``) is served from the replay
+    stub with the recordings hidden and a canary in the environment; an
+    offline example passes through untouched.
+    """
+
+    from repoproof.execution.open_api_replay import replay_session
+
+    with replay_session(input_path, hosts=open_api_hosts, stage_dir=stage_dir) as session:
+        process = subprocess.run(
+            [python, str(runner), str(reference), str(session.tool_input), str(reference_output)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env={**os.environ, **session.env},
+        )
+        codes = session.verdict(reference_output if reference_output.is_dir() else None)
+        details = session.details()
+    return _ReferenceExecution(process=process, session_codes=codes, session_details=details)
+
+
+def _reference_failure_detail(stderr: str) -> str:
+    """The fixed sentence plus the last line the reference said: a failure locates itself."""
+
+    lines = [line.strip() for line in str(stderr or "").splitlines() if line.strip()]
+    tail = lines[-1][:240] if lines else ""
+    base = "冻结 reference implementation 无法运行第一个公开样例"
+    return f"{base}:{tail}" if tail else base
+
 def run_product_preflight(
     *,
     project_root: Path,
@@ -202,7 +253,7 @@ def run_product_preflight(
     tool_schema_version = int(tool_document.get("schema_version") or 1)
     delivery_profile_id = str(tool_document.get("delivery_profile_id") or "cli_v2")
     workspace_contract: WorkspaceArtifactContractV1 | None = None
-    if delivery_profile_id == "workspace_bundle_v1":
+    if is_workspace_profile(delivery_profile_id):
         if tool_schema_version != 4:
             return _failure(
                 checks,
@@ -354,7 +405,7 @@ def run_product_preflight(
     try:
         truth = json.loads(truth_path.read_text(encoding="utf-8"))
         first = (truth.get("examples") or [])[0]
-        if delivery_profile_id == "workspace_bundle_v1":
+        if is_workspace_profile(delivery_profile_id):
             input_path = _fixture_path(
                 skeleton, f"{first['example_id']}/input"
             )
@@ -443,7 +494,7 @@ def run_product_preflight(
 
         runner = temp_root / "run_reference.py"
         reference_output = temp_root / "reference-output"
-        if delivery_profile_id == "workspace_bundle_v1":
+        if is_workspace_profile(delivery_profile_id):
             # The public workspace profile requires a caller-supplied path that
             # does not exist.  Pre-creating it here would both reject conforming
             # producers and let non-conforming producers pass a different
@@ -461,19 +512,40 @@ def run_product_preflight(
             reference_command = [
                 str(python), str(runner), str(reference), str(input_path)
             ]
-        reference_run = subprocess.run(
-            reference_command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
+        if is_workspace_profile(delivery_profile_id):
+            # An open-API example carries its recordings; the reference runs
+            # the sealed way here too (incident-preflight-runs-open-api-reference-unsealed-*).
+            executed = _execute_workspace_reference(
+                python=str(python),
+                runner=runner,
+                reference=reference,
+                input_path=input_path,
+                reference_output=reference_output,
+                open_api_hosts=tuple(workspace_contract.open_api_hosts) if workspace_contract is not None else (),
+                stage_dir=temp_root / "open-api-session",
+            )
+            reference_run = executed.process
+            if executed.session_codes:
+                return _failure(
+                    checks,
+                    owner="CONTRACT",
+                    code=executed.session_codes[0],
+                    detail="冻结 reference 在回放会话里越界:" + "; ".join(executed.session_details[:4]),
+                )
+        else:
+            reference_run = subprocess.run(
+                reference_command,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
         if reference_run.returncode != 0:
             return _failure(
                 checks,
                 owner="CONTRACT",
                 code="REFERENCE_EXECUTION_FAILED",
-                detail="冻结 reference implementation 无法运行第一个公开样例",
+                detail=_reference_failure_detail(reference_run.stderr),
             )
         checks.append(ProductPreflightCheck(name="reference_execution", ok=True))
 

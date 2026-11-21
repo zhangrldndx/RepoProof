@@ -12,6 +12,7 @@ from typing import Literal
 
 import streamlit as st
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.ui.product_theme import (
     apply_product_theme,
     hero,
@@ -1006,7 +1007,7 @@ def _render_primary_contract_and_examples(journey: dict, fallback_review: dict) 
     tool = draft.get("tool") or {}
     workspace_profile = (
         int(tool.get("schema_version") or 1) == 4
-        and tool.get("delivery_profile_id") == "workspace_bundle_v1"
+        and is_workspace_profile(tool.get("delivery_profile_id"))
     )
     interface = tool.get("interface") or {}
     capability = draft.get("capability") or {}
@@ -1664,10 +1665,10 @@ def _render_journey_card(snapshot: dict) -> None:
     draft_tool = (snapshot.get("draft_review") or {}).get("draft") or {}
     draft_tool = draft_tool.get("tool") or {}
     workspace_profile = (
-        result.get("delivery_profile_id") == "workspace_bundle_v1"
+        is_workspace_profile(result.get("delivery_profile_id"))
         or (
             int(draft_tool.get("schema_version") or 1) == 4
-            and draft_tool.get("delivery_profile_id") == "workspace_bundle_v1"
+            and is_workspace_profile(draft_tool.get("delivery_profile_id"))
         )
     )
     if workspace_profile:

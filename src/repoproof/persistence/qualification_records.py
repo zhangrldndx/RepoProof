@@ -202,7 +202,7 @@ class QualificationCaseResultV2(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     case_name: str = Field(min_length=1, max_length=128)
-    delivery_profile_id: Literal["workspace_bundle_v1"] = "workspace_bundle_v1"
+    delivery_profile_id: Literal["workspace_bundle_v1", "open_api_workspace_v1"] = "workspace_bundle_v1"
     status: Literal["PASSED", "FAILED", "EXPECTED_REJECTION"]
     journey_id: str | None = Field(default=None, max_length=128)
     task_id: str | None = Field(default=None, max_length=256)

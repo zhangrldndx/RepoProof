@@ -328,9 +328,8 @@ def run_workspace_semantic_verifier(
             )[:200]
         if not actual.receipts_ok:
             reasons.append("UPSTREAM_CALL_NOT_OBSERVED")
-            verdict_details["UPSTREAM_CALL_NOT_OBSERVED"] = (
-                "the verifier finished without a recorded call into the pinned upstream module; "
-                "the verdict must depend on values the upstream returns"
+            verdict_details["UPSTREAM_CALL_NOT_OBSERVED"] = upstream_call_marker_detail(
+                imports=int(actual.upstream_imports), calls=int(actual.upstream_calls)
             )
         actual_pass = bool(
             actual.protocol_ok
@@ -509,6 +508,7 @@ def write_workspace_semantic_evidence(
 # --------------------------------------------------------------------------
 
 MutationResult = Literal["REJECTED", "ACCEPTED", "PROTOCOL_ERROR"]
+_MUTATION_EXCERPT_CHARS = 120
 
 
 class WorkspaceVerifierMutationV1(BaseModel):
@@ -516,6 +516,10 @@ class WorkspaceVerifierMutationV1(BaseModel):
 
     kind: str = Field(min_length=1, max_length=40)
     result: MutationResult
+    # The original line the mutation touched (actual side, bounded): a judge
+    # repaired against "edit-line-71" alone could not see line 71 at all
+    # (incident-discrimination-gap-names-unseen-lines-*).
+    excerpt: str = Field(default="", max_length=_MUTATION_EXCERPT_CHARS)
 
 
 class WorkspaceVerifierFileProbeV1(BaseModel):
@@ -532,7 +536,49 @@ class WorkspaceVerifierDiscriminationV1(BaseModel):
     probed_files: int = Field(ge=0)
     files: tuple[WorkspaceVerifierFileProbeV1, ...] = ()
     gaps: tuple[str, ...] = ()
+    # Delivered files byte-identical to something the pinned upstream ships:
+    # their truth is that identity, which the Harness checks by hash; the judge
+    # is not asked to discriminate edits inside a 3 MB vendored library
+    # (incident-discrimination-probe-mutates-upstream-copies-*).
+    provenance_bound: tuple[str, ...] = ()
     ok: bool
+
+
+_PROVENANCE_MIN_BYTES = 512
+
+
+def upstream_call_marker_detail(*, imports: int, calls: int) -> str:
+    """Say what the receipts counted and what counts, not just that the bar was missed.
+
+    A judge whose only contact with the upstream was an import plus one
+    attribute read was told four times that no call was observed, and kept the
+    attribute read (incident-upstream-call-marker-without-counts-*).
+    """
+
+    return (
+        f"the verifier finished without a recorded call into the pinned upstream module "
+        f"(receipts observed imports={imports} calls={calls}); imports and attribute reads such as "
+        "module.__version__ or module.Name are not calls — a call is recorded when an upstream "
+        "function or class is actually invoked, and the verdict must depend on the value it returns "
+        "(decode, parse or recompute with the upstream's own API)"
+    )[:400]
+
+
+def _upstream_shipped_digests(upstream_dir: Path) -> set[str]:
+    digests: set[str] = set()
+    root = Path(upstream_dir)
+    if not root.is_dir():
+        return digests
+    for path in root.rglob("*"):
+        if ".git" in path.parts or not path.is_file() or path.is_symlink():
+            continue
+        try:
+            if path.stat().st_size < _PROVENANCE_MIN_BYTES:
+                continue
+            digests.add(hashlib.sha256(path.read_bytes()).hexdigest())
+        except OSError:
+            continue
+    return digests
 
 
 def _alter_character(char: str) -> str:
@@ -582,13 +628,7 @@ def _text_content_mutations(
 
     budget = max(1, int(limit))
     edit_budget = max(1, budget - 1)
-    def _even(rows: list[int], count: int) -> list[int]:
-        if count <= 0 or not rows:
-            return []
-        if len(rows) <= count:
-            return list(rows)
-        step = (len(rows) - 1) / (count - 1) if count > 1 else 0
-        return sorted({rows[round(k * step)] for k in range(count)})
+    _even = _even_sample
 
     carrying = [
         index
@@ -612,6 +652,55 @@ def _text_content_mutations(
     return mutations
 
 
+def _even_sample(rows: list, count: int) -> list:
+    if count <= 0 or not rows:
+        return []
+    if len(rows) <= count:
+        return list(rows)
+    step = (len(rows) - 1) / (count - 1) if count > 1 else 0
+    picked = {round(k * step) for k in range(count)}
+    return [rows[index] for index in sorted(picked)]
+
+
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>(.*?)</script>", re.I | re.S)
+# A number in JSON value position: not glued to an identifier, followed by the
+# separator that closes a value.  Editing its last digit keeps the grammar.
+_DATA_NUMBER_RE = re.compile(r"(?<![\w.\-])(-?\d+(?:\.\d+)?)(?=\s*[,\]\}])")
+DATA_LAYER_MUTATION_BUDGET = 3
+
+
+def _data_layer_regions(text: str) -> list[tuple[int, int]]:
+    """Where a delivered file keeps its data: a JSON document, or script bodies in HTML."""
+
+    if text.lstrip()[:1] in {"{", "["}:
+        return [(0, len(text))]
+    return [(match.start(1), match.end(1)) for match in _SCRIPT_BLOCK_RE.finditer(text)]
+
+
+def _data_layer_mutations(text: str, *, limit: int) -> list[tuple[str, bytes]]:
+    """Change one numeric value of the embedded data, leaving the grammar intact.
+
+    A dashboard is nearly all chart-library boilerplate; its semantics are a
+    JSON blob inside a script element (or a sidecar .json file), often one very
+    long line.  A character edit in the middle of that line usually breaks the
+    JSON, and a verifier that merely failed to parse it counts as "rejected"
+    without ever having been asked whether it recomputes those numbers.  These
+    mutations ask exactly that: the value changes, the document still parses.
+    """
+
+    spans: list[tuple[int, int]] = []
+    for start, end in _data_layer_regions(text):
+        spans.extend(
+            (match.start(1), match.end(1)) for match in _DATA_NUMBER_RE.finditer(text, start, end)
+        )
+    mutations: list[tuple[str, bytes]] = []
+    for ordinal, (start, end) in enumerate(_even_sample(spans, max(0, int(limit))), start=1):
+        number = text[start:end]
+        edited = number[:-1] + _alter_character(number[-1])
+        mutations.append((f"data-value-{ordinal}", (text[:start] + edited + text[end:]).encode("utf-8")))
+    return mutations
+
+
 def _binary_content_mutations(payload: bytes) -> list[tuple[str, bytes]]:
     if not payload:
         return []
@@ -623,15 +712,47 @@ def _binary_content_mutations(payload: bytes) -> list[tuple[str, bytes]]:
     return mutations
 
 
+def mutation_excerpts(payload: bytes, kinds) -> dict[str, str]:
+    """What each named mutation touched, quoted from the ORIGINAL (actual-side) bytes, bounded.
+
+    ``edit-line-N`` quotes line N; ``truncate-last-line`` quotes the last
+    non-empty line; other kinds (data-layer, binary) quote nothing.
+    """
+
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return {str(kind): "" for kind in kinds}
+    out: dict[str, str] = {}
+    for kind in kinds:
+        name = str(kind)
+        excerpt = ""
+        if name.startswith("edit-line-"):
+            number = name.rsplit("-", 1)[-1]
+            if number.isdigit() and 1 <= int(number) <= len(lines):
+                excerpt = lines[int(number) - 1].strip()[:_MUTATION_EXCERPT_CHARS]
+        elif name == "truncate-last-line":
+            nonempty = [line for line in lines if line.strip()]
+            if nonempty:
+                excerpt = nonempty[-1].strip()[:_MUTATION_EXCERPT_CHARS]
+        out[name] = excerpt
+    return out
+
+
 def content_mutations(
     payload: bytes, *, limit: int, input_tokens: tuple[str, ...] | frozenset[str] = ()
 ) -> list[tuple[str, bytes]]:
-    """Deterministic content mutations for one delivered file."""
+    """Deterministic content mutations for one delivered file.
 
-    mutations = _text_content_mutations(
-        payload, limit=limit, input_tokens=input_tokens
-    ) or _binary_content_mutations(payload)
-    return mutations[: max(1, int(limit))]
+    Data-layer value edits come first and on their own small budget: targeting
+    adds questions, it never removes the line edits or the truncation.
+    """
+
+    text_mutations = _text_content_mutations(payload, limit=limit, input_tokens=input_tokens)
+    if not text_mutations:
+        return _binary_content_mutations(payload)[: max(1, int(limit))]
+    data = _data_layer_mutations(payload.decode("utf-8"), limit=DATA_LAYER_MUTATION_BUDGET)
+    return data + text_mutations[: max(1, int(limit))]
 
 
 def _input_semantic_tokens(input_path: Path, *, limit: int = 400) -> frozenset[str]:
@@ -702,6 +823,8 @@ def probe_workspace_verifier_discrimination(
         raise SemanticVerifierError("workspace artifact must be a directory")
 
     owned: list[tuple[str, Path]] = []
+    provenance_bound: list[str] = []
+    shipped: set[str] | None = None
     for path in sorted(artifact_dir.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
@@ -712,6 +835,12 @@ def probe_workspace_verifier_discrimination(
             continue
         if path.stat().st_size == 0:
             continue
+        if path.stat().st_size >= _PROVENANCE_MIN_BYTES:
+            if shipped is None:
+                shipped = _upstream_shipped_digests(Path(upstream_dir))
+            if hashlib.sha256(path.read_bytes()).hexdigest() in shipped:
+                provenance_bound.append(relative)
+                continue
         owned.append((relative, path))
         if len(owned) >= max(1, int(max_files)):
             break
@@ -739,11 +868,11 @@ def probe_workspace_verifier_discrimination(
         for index, (relative, path) in enumerate(owned):
             payload = path.read_bytes()
             results: list[WorkspaceVerifierMutationV1] = []
-            for mutation_index, (kind, mutated_payload) in enumerate(
-                content_mutations(
-                    payload, limit=max_mutations_per_file, input_tokens=input_tokens
-                )
-            ):
+            planned = content_mutations(
+                payload, limit=max_mutations_per_file, input_tokens=input_tokens
+            )
+            excerpts = mutation_excerpts(payload, [kind for kind, _mutated in planned])
+            for mutation_index, (kind, mutated_payload) in enumerate(planned):
                 stage = root / f"mutation-{index}-{mutation_index}"
                 source_copy = stage / "source"
                 shutil.copytree(artifact_dir, source_copy, symlinks=False)
@@ -768,7 +897,9 @@ def probe_workspace_verifier_discrimination(
                     outcome = "ACCEPTED"
                 else:
                     outcome = "REJECTED"
-                results.append(WorkspaceVerifierMutationV1(kind=kind, result=outcome))
+                results.append(
+                    WorkspaceVerifierMutationV1(kind=kind, result=outcome, excerpt=excerpts.get(kind, ""))
+                )
             files.append(
                 WorkspaceVerifierFileProbeV1(
                     path=relative,
@@ -781,5 +912,6 @@ def probe_workspace_verifier_discrimination(
         probed_files=len(files),
         files=tuple(files),
         gaps=gaps,
+        provenance_bound=tuple(provenance_bound),
         ok=not gaps,
     )

@@ -198,7 +198,9 @@ def test_builder_output_kind_must_match_blueprint(tmp_path: Path) -> None:
         "    output_path.write_text('not a directory')\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="output kind"):
+    # A stable builder-owned code, not a pydantic message
+    # (incident-public-code-is-exception-text-*).
+    with pytest.raises(FixtureBuilderError, match="FIXTURE_BUILDER_OUTPUT_KIND_MISMATCH"):
         build_fixture_candidate(
             blueprint=_blueprint(),
             builder_id="wrong-kind-v1",

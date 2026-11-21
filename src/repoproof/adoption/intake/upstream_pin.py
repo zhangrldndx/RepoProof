@@ -123,6 +123,21 @@ def _verified_release_tag_version(
     return version
 
 
+_PLACEHOLDER_VERSION_RE = re.compile(r"^(?:0(?:\.0)*(?:[.+-]?dev\d*)?|unknown|dynamic|placeholder|0\+unknown)$", re.I)
+
+
+def is_placeholder_version(version: str) -> bool:
+    """``0.0.0`` / ``unknown`` / ``0.0.0.dev0``: a slot release automation fills, not a release.
+
+    A polyglot SDK declares ``version = "0.0.0"`` in its pyproject and lets
+    semantic-release stamp the tag; taking the placeholder literally pins
+    ``dist==0.0.0`` and the wheelhouse dies in pip
+    (incident-placeholder-version-outranks-tag-*).
+    """
+
+    return bool(_PLACEHOLDER_VERSION_RE.fullmatch(str(version or "").strip()))
+
+
 def upstream_version(
     upstream_dir: Path,
     *,
@@ -147,20 +162,40 @@ def upstream_version(
             data = {}
         v = ((data.get("project") or {}).get("version")
              or ((data.get("tool") or {}).get("poetry") or {}).get("version"))
-        if isinstance(v, str) and v.strip():
+        if isinstance(v, str) and v.strip() and not is_placeholder_version(v):
             return v.strip()
+    # A polyglot monorepo keeps the Python package (and its pyproject) in a
+    # subdirectory; only a pyproject whose [project].name is this distribution
+    # may speak for it (incident-lock-underivable-in-monorepo-*).
+    wanted = normalize_dist_name(distribution) if distribution else ""
+    if wanted and root.is_dir():
+        for child in sorted(root.iterdir()):
+            sub = child / "pyproject.toml"
+            if child.name.startswith(".") or not child.is_dir() or child.is_symlink() or not sub.is_file():
+                continue
+            try:
+                data = tomllib.loads(sub.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            project = data.get("project") or {}
+            poetry = (data.get("tool") or {}).get("poetry") or {}
+            name = str(project.get("name") or poetry.get("name") or "")
+            if name and normalize_dist_name(name) == wanted:
+                v = project.get("version") or poetry.get("version")
+                if isinstance(v, str) and v.strip() and not is_placeholder_version(v):
+                    return v.strip()
     cfg = root / "setup.cfg"
     if cfg.is_file():
         m = re.search(r"^\s*version\s*=\s*(\S+)\s*$",
                       cfg.read_text(encoding="utf-8", errors="replace"),
                       re.MULTILINE)
-        if m:
+        if m and not is_placeholder_version(m.group(1)):
             return m.group(1).strip()
     for info in sorted(root.glob("*.egg-info/PKG-INFO")):
         m = re.search(r"^Version:\s*(\S+)\s*$",
                       info.read_text(encoding="utf-8", errors="replace"),
                       re.MULTILINE)
-        if m:
+        if m and not is_placeholder_version(m.group(1)):
             return m.group(1).strip()
     module_parts = import_module.split(".") if import_module else []
     if module_parts and all(

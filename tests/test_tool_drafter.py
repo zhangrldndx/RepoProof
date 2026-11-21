@@ -700,14 +700,18 @@ def test_litellm_retry_then_parse(monkeypatch, world):
                  ("REPOPROOF_DRAFTER_BASE", "http://x"),
                  ("REPOPROOF_DRAFTER_KEY", "k")):
         monkeypatch.setenv(k, v)
+    # The drafting protocol opens with Core's intent reading (m6.4): one narrow
+    # call before the proposal, then the proposal (retried once here), then the
+    # independent verifier.
     calls = _stub_litellm(
         monkeypatch,
-        ["not json at all", _GOOD, _GOOD_VERIFIER],
+        ['{"data_sources": [], "deliverables": []}', "not json at all", _GOOD, _GOOD_VERIFIER],
     )
     out = draft_into_bundle(rep, dest, LiteLLMDrafter())
-    assert calls["n"] == 3 and "capability.statement" in out["fields_drafted"]
-    assert "semantic_verifier" not in calls["kwargs"][1]["messages"][0]["content"]
-    verifier_call = calls["kwargs"][2]
+    assert calls["n"] == 4 and "capability.statement" in out["fields_drafted"]
+    assert "data_sources" in calls["kwargs"][0]["messages"][0]["content"]
+    assert "semantic_verifier" not in calls["kwargs"][2]["messages"][0]["content"]
+    verifier_call = calls["kwargs"][3]
     assert "independent semantic verifier" in verifier_call["messages"][0]["content"]
     verifier_context = verifier_call["messages"][1]["content"]
     assert "reference_impl" not in verifier_context

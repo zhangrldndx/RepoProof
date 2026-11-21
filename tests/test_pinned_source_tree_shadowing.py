@@ -14,6 +14,12 @@
   I2 少数缺失只如实报告(PARTIAL),不判死——本批有两个这样的仓库最终跑通了;
   I3 一个不缺 = COMPLETE;
   I4 比不了(没有发行版或找不到源码包)就不下结论,绝不默认判死。
+
+m6.4 S0 预检又暴露两种误判死(两个独立上游,incident-supply-gate-condemns-a-usable-checkout-*):
+  I5 源码包在 src/ 之下时,密封 PYTHONPATH 只含检出根目录,发行版根本没被遮蔽——
+     缺多少构建期文件都与生产者无关,判 NOT_SHADOWING,usable;
+  I6 缺的是编译翻译(.mo)而同目录 .po 源俱在:gettext 缺 .mo 回退到消息 id,功能可用——
+     这类文件按"可派生"计,不算缺失;全部可派生 = DERIVABLE,usable。
 """
 
 from __future__ import annotations
@@ -80,8 +86,9 @@ def test_a_few_compiled_artifacts_are_reported_but_not_fatal(tmp_path: Path) -> 
         upstream_dir=root, wheelhouse=house, distribution="pkg", import_module="pkg"
     )
     assert verdict["usable"] is True, "少数缺失不判死:本批有两个这样的仓库跑通了"
-    assert verdict["severity"] == "PARTIAL"
-    assert verdict["missing_count"] == 31
+    # The .po sources of every missing .mo are present: nothing is absent, it is derivable.
+    assert verdict["severity"] == "DERIVABLE"
+    assert verdict["missing_count"] == 0 and verdict["derivable_count"] == 31
 
 
 def test_one_generated_version_file_is_not_fatal(tmp_path: Path) -> None:
@@ -260,3 +267,52 @@ def test_the_gate_still_leaves_a_durable_report(monkeypatch, tmp_path: Path) -> 
     assert durable is not None, "供给判死也要留下报告"
     assert durable.ok is False, "旧的 PASSED 报告绝不能活下来"
     assert "UNSUPPORTED_PINNED_UPSTREAM" in durable.final_reason_codes
+
+
+def test_a_src_layout_checkout_never_shadows_the_producer(tmp_path: Path) -> None:
+    """src/ 布局:密封 PYTHONPATH 只含检出根目录,发行版没被遮蔽——缺再多构建期文件也不判死。"""
+
+    released = {"pkg/__init__.py": b"x", "pkg/core.py": b"x"}
+    released.update({f"pkg/server/static/js/bundle-{i}.js": b"j" for i in range(793)})
+    house = _release(tmp_path, "pkg", released)
+    root = tmp_path / "upstream"
+    for name in ("src/pkg/__init__.py", "src/pkg/core.py"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    verdict = pinned_source_tree_shadowing(
+        upstream_dir=root, wheelhouse=house, distribution="pkg", import_module="pkg"
+    )
+    assert verdict["usable"] is True
+    assert verdict["severity"] == "NOT_SHADOWING"
+    assert verdict["missing_count"] == 793, "如实报告缺了多少,只是不判死"
+
+
+def test_compiled_translations_with_their_sources_present_are_derivable(tmp_path: Path) -> None:
+    """平铺布局、缺 707 个 .mo、同目录 .po 俱在:全部可派生,usable。"""
+
+    modules = {f"pkg/m{i}.py": b"x" for i in range(150)}
+    released = {"pkg/__init__.py": b"x", **modules}
+    released.update({f"pkg/locale/l{i}/LC_MESSAGES/X.mo": b"m" for i in range(707)})
+    house = _release(tmp_path, "pkg", released)
+    files = {"pkg/__init__.py": b"x", **modules, **{f"pkg/locale/l{i}/LC_MESSAGES/X.po": b"p" for i in range(707)}}
+    root = _checkout(tmp_path, "pkg", files)
+    verdict = pinned_source_tree_shadowing(
+        upstream_dir=root, wheelhouse=house, distribution="pkg", import_module="pkg"
+    )
+    assert verdict["usable"] is True
+    assert verdict["severity"] == "DERIVABLE"
+    assert verdict["missing_count"] == 0 and verdict["derivable_count"] == 707
+
+
+def test_generated_data_without_sources_is_still_absent(tmp_path: Path) -> None:
+    """对照:.dat 没有任何在场源文件可派生——仍判死(I1 的守卫)。"""
+
+    released = {"pkg/__init__.py": b"x"}
+    released.update({f"pkg/locale-data/{i}.dat": b"d" for i in range(200)})
+    house = _release(tmp_path, "pkg", released)
+    root = _checkout(tmp_path, "pkg", {"pkg/__init__.py": b"x", "pkg/locale-data/.gitignore": b"*.dat\n"})
+    verdict = pinned_source_tree_shadowing(
+        upstream_dir=root, wheelhouse=house, distribution="pkg", import_module="pkg"
+    )
+    assert verdict["usable"] is False and verdict["severity"] == "PACKAGE_LARGELY_ABSENT"

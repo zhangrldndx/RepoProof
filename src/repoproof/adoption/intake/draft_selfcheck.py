@@ -24,6 +24,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.execution.core_execution import atomic_write_json
 
 SELF_CHECK_FILENAME = "draft_selfcheck.json"
@@ -169,11 +170,55 @@ _REFERENCE_CODES = frozenset(
         "WORKSPACE_REFERENCE_PROTOCOL_INVALID",
         "WORKSPACE_REFERENCE_CONTRACT_FAILED",
         "WORKSPACE_REFERENCE_PROCESS_FAILED",
+        # Open-API workspaces: the producer asked for something unrecorded,
+        # forwarded/wrote the sealed canary, or never used the replay at all.
+        "WORKSPACE_REFERENCE_UNRECORDED_REQUEST",
+        "WORKSPACE_REFERENCE_CREDENTIAL_LEAK",
+        "WORKSPACE_REFERENCE_NO_API_CALLS",
     }
 )
+# The fixture builder owns the recordings: a fixture without __responses__ is
+# the builder's omission, not the producer's.
+_BUILDER_OWNED_REFERENCE_CODES = frozenset({"WORKSPACE_REFERENCE_RESPONSES_MISSING"})
+
+# Runtime resources outside the delivered closure (CDN scripts, online tiles)
+# are not a producer defect: an upstream with no offline rendering path cannot
+# be repaired into one.  The self-check turns that class into a proposal the
+# user decides on (m6.4 prework 8b).
+_CLOSURE_EXTERNAL_MARKERS = (
+    "WORKSPACE_HTML_EXTERNAL_RESOURCE",
+    "FRONTEND_ASSET_NOT_FROM_UPSTREAM",
+    "PDF_CANNOT_RENDER_INPUT_SCRIPT",
+)
+
+
+def output_form_downgrade_proposal(diagnostics: tuple[str, ...] | list[str]) -> dict | None:
+    rows = [str(item) for item in diagnostics if any(mark in str(item) for mark in _CLOSURE_EXTERNAL_MARKERS)]
+    if not rows:
+        return None
+    references: list[str] = []
+    for row in rows:
+        _code, _sep, rest = row.partition(":")
+        rest = rest.strip()
+        if rest and rest not in references:
+            references.append(rest)
+    where = f"(页面引用了 {'; '.join(references[:3])})" if references else ""
+    text = (
+        f"交付形态含闭包外的运行期资源{where}。密封交付不允许运行期联网,这不是生产者能修的缺陷。"
+        "可选降级,请你抉择:① 让上游以离线/内联模式渲染,把图表库或底图资源作为合同内文件随工作区交付;"
+        "② 改交付形态为自包含静态图(SVG/PNG)加数据文件(JSON/CSV),网页只读本地文件;"
+        "③ 上游没有离线渲染路径时,换上游或改题(新任务版本)。"
+    )
+    return {
+        "kind": "OUTPUT_FORM",
+        "codes": list(_CLOSURE_EXTERNAL_MARKERS),
+        "references": references[:3],
+        "text": text,
+    }
 _VERIFIER_CODES = frozenset(
     {
         "WORKSPACE_SEMANTIC_SCREEN_EXECUTION_FAILED",
+        "WORKSPACE_SEMANTIC_VERIFIER_EVIDENCE_INVALID",
         "VERIFIER_DISCRIMINATION_GAP",
     }
 )
@@ -283,7 +328,7 @@ def is_workspace_draft(draft: dict) -> bool:
         profile = delivery.get("profile_id")
     if profile is None and isinstance(tool, dict):
         profile = tool.get("delivery_profile_id")
-    return profile == WORKSPACE_PROFILE_ID
+    return is_workspace_profile(profile)
 
 
 def is_machine_drafted(draft_dir: Path) -> bool:
@@ -329,8 +374,22 @@ def _names_the_verifier_by_construction(diagnostics: tuple[str, ...] | list[str]
     return any(
         marker in str(item).upper()
         for item in diagnostics
-        for marker in ("_BINDING_CONTROL_FAILED", "VERIFIER_INFORMATIONAL_")
+        # A judge that cannot recompute from recordings the producer built the
+        # artifact from is looking in the wrong place: its claim, its repair
+        # (incident-fresh-probe-scenarios-drift-and-input-insufficient-routing-*).
+        for marker in (
+            "_BINDING_CONTROL_FAILED",
+            "VERIFIER_INFORMATIONAL_",
+            "VERIFIER_INPUT_INSUFFICIENT",
+            # The judge never called the upstream: only the judge can change that
+            # (incident-upstream-call-not-observed-routed-to-producer-*).
+            "UPSTREAM_CALL_NOT_OBSERVED",
+        )
     )
+
+
+def _input_insufficient(diagnostics: tuple[str, ...] | list[str]) -> bool:
+    return any("VERIFIER_INPUT_INSUFFICIENT" in str(item) for item in diagnostics or ())
 
 
 def repair_target_for(
@@ -348,6 +407,12 @@ def repair_target_for(
     code = str(reason_code or "")
     if not code:
         return None
+    if code == _DISAGREEMENT_CODE and _input_insufficient(diagnostics) and int(round_index) > 2:
+        # The judge said the recording cannot answer, twice, and repairing the
+        # judge changed nothing: the recording itself is the other suspect, so
+        # the builder and the judge alternate from here
+        # (incident-input-insufficient-never-leaves-the-verifier-*).
+        return "builder" if int(round_index) % 2 == 1 else "verifier"
     if code == _DISAGREEMENT_CODE and _names_the_verifier_by_construction(diagnostics):
         # A Harness-run binding control proves the verdict ignored the input or
         # the pinned upstream's returned values, and an informational verdict is
@@ -389,12 +454,42 @@ def repair_target_for(
             # (incident-structural-contract-failure-never-alternates-*).
             return "contract" if round_index % 2 == 1 else "reference"
         return "reference"
+    if code == "OPEN_API_HOSTS_MISSING":
+        # A contract supply fact: only the contract can declare the hosts.
+        return "contract"
+    if code == "WORKSPACE_REFERENCE_DEPENDENCY_MISSING":
+        # The producer imported what the sealed runtime does not have; the
+        # diagnostics name the module.  Its owner said CONTRACT while the
+        # router said nobody (incident-dependency-missing-unrouted-*).
+        return "reference"
+    if code == "WORKSPACE_REFERENCE_UNUSED_RECORDING":
+        # A recording nobody requests: the builder recorded it, so it answers
+        # first; the producer — which may have to discover and request it —
+        # alternates (incident-recording-nobody-requested-becomes-the-judges-truth-*).
+        return "builder" if round_index % 2 == 1 else "reference"
+    if code == "WORKSPACE_REFERENCE_UNRECORDED_REQUEST":
+        # The producer's requests and the fixture's recordings disagree: the
+        # builder answers first (it records; the diagnostics name the exact
+        # keys), the producer second, and so on
+        # (incident-unrecorded-request-routed-only-to-producer-*).
+        return "builder" if round_index % 2 == 1 else "reference"
     if code in _REFERENCE_CODES:
         return "reference"
+    if code in _BUILDER_OWNED_REFERENCE_CODES:
+        return "builder"
     if code in _BUILDER_SYSTEMIC_CODES:
         return None
     if code == "WORKSPACE_REFERENCE_FIXTURE_REJECTED":
-        return "builder"
+        # The producer *says* the fixture is wrong; it may be the producer that
+        # misjudged (a missing output directory is not user input).  Builder
+        # first, then the producer, and so on
+        # (incident-fixture-rejection-and-builder-error-routing-*).
+        return "builder" if round_index % 2 == 1 else "reference"
+    if code == "FIXTURE_RECORDS_KNOWN_BOUNDARY":
+        # The builder recorded an endpoint the rehearsal proved unusable; it
+        # answers first, and the producer — which calls that endpoint too —
+        # alternates (incident-known-boundary-reused-by-builder-code-*).
+        return "builder" if round_index % 2 == 1 else "reference"
     if code.startswith("FIXTURE_") or code.startswith("WORKSPACE_FIXTURE_BLUEPRINT"):
         return "builder"
     return None

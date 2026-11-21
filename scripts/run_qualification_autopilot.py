@@ -43,6 +43,51 @@ def _run(argv: list[str]) -> dict:
 
 
 
+_BLOCKING_BOUNDARY_CODES = ("PLATFORM_REQUIRES_CREDENTIALS", "ENDPOINT_GONE", "METHOD_NOT_ALLOWED")
+
+
+def prior_known_boundaries(case_dir: Path) -> list[dict]:
+    """Boundaries earlier journeys of this case proved against today's hosts.
+
+    Read from every attempt's live-probe rows (first pass and redraft alike);
+    only the blocking classes travel, de-duplicated by host and path.  A journey
+    that starts without them guesses the same refused endpoint again
+    (incident-known-boundaries-forgotten-across-attempts-*).
+    """
+
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    if not Path(case_dir).is_dir():
+        return rows
+    for report in sorted(Path(case_dir).glob("attempt-*/stages/rehearsal*.json")):
+        try:
+            payload = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        probe = ((payload.get("stages") or {}).get("live_probe") or {}) if isinstance(payload, dict) else {}
+        for row in probe.get("requests") or []:
+            # Walls and successes both travel: a host with only walls and no
+            # success is a fact the next draft must be told
+            # (incident-endpoint-guessing-on-a-proven-unusable-host-*).
+            code = str(row.get("code") or "") if isinstance(row, dict) else ""
+            if code not in _BLOCKING_BOUNDARY_CODES and code != "OK":
+                continue
+            key = (str(row.get("host") or ""), str(row.get("path") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "host": key[0],
+                    "path": key[1],
+                    "query": str(row.get("query") or ""),
+                    "code": str(row.get("code") or ""),
+                    "detail": str(row.get("detail") or "")[:240],
+                }
+            )
+    return rows
+
+
 def _latest_phase1_report(record_dir: Path) -> Path:
     """Newest phase-1 report: attempt-N/ (highest N) wins over the first attempt at top level."""
 
@@ -112,6 +157,13 @@ def main() -> int:
                 argv += ["--revision", str(case["revision"])]
             if case.get("kind") == "expected_rejection":
                 argv.append("--expect-admission-rejection")
+            if case.get("downgrade_allowed"):
+                # The protocol lets this case reach ACTIVE through the boundary
+                # proposal; the autopilot stands in for the user once.
+                argv.append("--accept-boundary-proposal")
+            remembered = prior_known_boundaries(case_dir)
+            if remembered:
+                argv += ["--known-boundaries-json", json.dumps(remembered, ensure_ascii=False)]
         else:
             previous = _latest_phase1_report(case_dir)
             if not previous.is_file():

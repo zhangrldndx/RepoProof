@@ -56,6 +56,7 @@ from repoproof.adoption.intake.tool_confirm import (
     confirm_tool_intent_file,
 )
 from repoproof.adoption.intake.workspace_fixtures import FixtureBlueprintV1
+from repoproof.domain.models import is_workspace_profile
 from repoproof.execution.core_execution import (
     LEGACY_LAB_STATE,
     RUNNING,
@@ -362,7 +363,7 @@ def read_managed_draft_review(value: Path) -> dict:
         tool = draft.get("tool") or {}
         workspace_profile = (
             int(tool.get("schema_version") or 1) == 4
-            and tool.get("delivery_profile_id") == "workspace_bundle_v1"
+            and is_workspace_profile(tool.get("delivery_profile_id"))
         )
         examples_name = "workspace_examples.yaml" if workspace_profile else "examples.yaml"
         raw_examples = _read_file_at(draft_fd, examples_name).decode("utf-8")
@@ -390,7 +391,7 @@ def read_managed_draft_review(value: Path) -> dict:
             "raw_draft": raw_draft,
             "examples": examples_doc.get("examples") or [],
             "delivery_profile_id": (
-                "workspace_bundle_v1" if workspace_profile else "cli_v2"
+                str(tool.get("delivery_profile_id")) if workspace_profile else "cli_v2"
             ),
             "workspace_contract": (
                 tool.get("workspace_contract") if workspace_profile else None
@@ -957,7 +958,7 @@ def save_draft_review(
         tool_document = draft.get("tool") or {}
         workspace_profile = (
             int(tool_document.get("schema_version") or 1) == 4
-            and tool_document.get("delivery_profile_id") == "workspace_bundle_v1"
+            and is_workspace_profile(tool_document.get("delivery_profile_id"))
         )
         if workspace_profile:
             from repoproof.domain.models import WorkspaceArtifactContractV1
@@ -1437,6 +1438,154 @@ def _assert_reference_reproducible(
 
 
 
+
+_PUBLIC_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{2,95}")
+
+
+def _exception_words(exc: BaseException) -> list[str]:
+    """The exception's own words, bounded: class name plus first line, then attached rows."""
+
+    lines = str(exc).strip().splitlines()
+    first = lines[0][:480] if lines else ""
+    rows = [f"{type(exc).__name__}: {first}" if first else type(exc).__name__]
+    # A pydantic rejection's first line only counts the errors; the field,
+    # the type and the message are what a repair can read.  Never the input
+    # value (incident-verifier-evidence-invalid-routed-to-builder-*).
+    for row in _validation_error_rows(exc)[:6]:
+        rows.append(row)
+    rows += [str(item)[:480] for item in (getattr(exc, "diagnostics", ()) or ()) if str(item)]
+    rows += [str(item)[:160] for item in (getattr(exc, "reason_codes", ()) or ()) if str(item)]
+    return list(dict.fromkeys(rows))[:12]
+
+
+def _validation_error_rows(exc: BaseException) -> list[str]:
+    """``Model.field: type — msg`` per pydantic error, input values excluded."""
+
+    errors_fn = getattr(exc, "errors", None)
+    if not callable(errors_fn):
+        return []
+    try:
+        errors = errors_fn(include_url=False, include_context=False, include_input=False)
+    except TypeError:
+        errors = errors_fn()
+    title = str(getattr(exc, "title", "") or type(exc).__name__)
+    rows: list[str] = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        loc = ".".join(str(part) for part in (error.get("loc") or ())) or "<model>"
+        rows.append(f"{title}.{loc}: {str(error.get('type') or '')[:60]} — {str(error.get('msg') or '')[:200]}")
+    return rows
+
+
+# Fields of the judge's evidence record that the judge itself authors; every
+# other field is filled by the Harness from hashes and the frozen contract.
+_VERIFIER_AUTHORED_EVIDENCE_FIELDS = frozenset(
+    {"passed", "reason_codes", "reason_details", "checked_commitment_ids"}
+)
+
+
+def _workspace_fixture_public_code(exc: BaseException) -> tuple[str, list[str]]:
+    """A stable public code for candidate generation, never the exception text.
+
+    Two journeys ended in round one with no repair route because the code was
+    the exception's message (a whole pydantic report) or its class name
+    (incident-public-code-is-exception-text-*).  The words still travel, as
+    diagnostics; the code is what the repair router can read.
+    """
+
+    from pydantic import ValidationError
+
+    own = str(getattr(exc, "code", "") or "").strip()
+    words = _exception_words(exc)
+    if own and _PUBLIC_CODE_RE.fullmatch(own):
+        return own, words
+    if isinstance(exc, ValidationError):
+        if str(getattr(exc, "title", "") or "") == "SemanticVerifierEvidenceV2":
+            # The judge's evidence record failed validation: the failing
+            # field says whose defect it is.  Four builder repairs once chased
+            # a judge-authored field under the fixture code
+            # (incident-verifier-evidence-invalid-routed-to-builder-*).
+            try:
+                errors = exc.errors(include_url=False, include_context=False, include_input=False)
+            except TypeError:
+                errors = exc.errors()
+            locs = {str((row.get("loc") or ("<model>",))[0]) for row in errors if isinstance(row, dict)}
+            if locs and locs <= _VERIFIER_AUTHORED_EVIDENCE_FIELDS:
+                return "WORKSPACE_SEMANTIC_VERIFIER_EVIDENCE_INVALID", words
+            return "WORKSPACE_SEMANTIC_EVIDENCE_RECORD_INVALID", words
+        return "FIXTURE_CANDIDATE_INVALID", words
+    return "FIXTURE_CANDIDATE_GENERATION_FAILED", words
+
+
+def _semantic_screen_failure(exc: BaseException):
+    """Wrap a verifier execution failure without losing what the verifier said.
+
+    Five rounds of an empty-diagnostic screen failure sent the judge to four
+    blind repairs (incident-semantic-screen-failure-drops-the-verifier-words-*).
+    """
+
+    from repoproof.execution.workspace_bundle import WorkspaceBundleError
+
+    words = _exception_words(exc)
+    first = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+    return WorkspaceBundleError(
+        "WORKSPACE_SEMANTIC_SCREEN_EXECUTION_FAILED", first, diagnostics=tuple(words)
+    )
+
+
+def _missing_lock_diagnostic(draft: dict) -> str:
+    source = (draft.get("source_repo") or {}) if isinstance(draft, dict) else {}
+    dist = str(source.get("distribution") or "?")
+    commit = str(source.get("resolved_commit") or "")[:12] or "?"
+    return (
+        f"reference.lock.txt 不存在,且无法从钉版树派生(发行版 {dist},commit {commit}):"
+        "查找了根目录 pyproject.toml 的 [project]/[tool.poetry] version、含同名 [project] 的一级子目录 "
+        "pyproject.toml、setup.cfg、*.egg-info/PKG-INFO、<import_module>/__init__.py 的 __version__、"
+        "与冻结 commit 一致的发布 tag。请在草稿目录写 reference.lock.txt(<发行版>==<版本>),"
+        "或改钉一个声明了版本的修订。"
+    )
+
+
+def _open_api_run_verdict(replay, *, process_failed: bool, crash_words: tuple[str, ...]):
+    """The stub's ledger decides first: an unrecorded request explains the crash it caused.
+
+    A producer that asks for what the fixture never recorded gets a 404 from the
+    stub; whether it then raises or swallows the error is incidental.  One root
+    cause used to surface as two codes and every repair went to the producer
+    alone (incident-unrecorded-request-routed-only-to-producer-*).
+    """
+
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME
+    from repoproof.execution.workspace_bundle import WorkspaceBundleError
+
+    if replay is None:
+        return None
+    unrecorded = replay.unrecorded()
+    if not unrecorded:
+        return None
+    rows = tuple(
+        f"{row.get('method', 'GET')} {row.get('host', '')}{row.get('path', '')}"
+        + (f"?{row['query']}" if row.get("query") else "")
+        for row in unrecorded[:8]
+    )
+    consequence = (
+        ("the producer then failed: " + "; ".join(str(word) for word in crash_words if str(word)),)
+        if process_failed and crash_words
+        else ()
+    )
+    return WorkspaceBundleError(
+        "WORKSPACE_REFERENCE_UNRECORDED_REQUEST",
+        rows[0],
+        diagnostics=(
+            f"{len(unrecorded)} request(s) had no recorded response in {RESPONSES_DIRNAME}; "
+            "the producer's requests and the fixture's recordings disagree — the builder records "
+            "exactly these keys, or the producer asks for what the fixture records",
+            *rows,
+            *consequence,
+        ),
+    )
+
 def _runtime_closure_bundle_error(exc: Exception) -> RuntimeError:
     """Project a runtime-closure failure into a bundle error with public diagnostics.
 
@@ -1447,8 +1596,8 @@ def _runtime_closure_bundle_error(exc: Exception) -> RuntimeError:
 
     from repoproof.execution.workspace_bundle import WorkspaceBundleError
 
-    code = str(getattr(exc, "code", "") or type(exc).__name__)
-    detail = str(getattr(exc, "detail", "") or "")
+    code = str(getattr(exc, "code", "") or "WORKSPACE_RUNTIME_CLOSURE_FAILED")
+    detail = str(getattr(exc, "detail", "") or "") or (str(exc).strip().splitlines() or [""])[0][:200]
     diagnostics: list[str] = [code]
     if code == "WORKSPACE_RUNTIME_APPLICATION_MISSING":
         diagnostics.append(
@@ -1575,7 +1724,7 @@ def _workspace_tool_from_draft(draft: dict):
         raise WorkspaceBundleError("WORKSPACE_CONTRACT_INVALID") from exc
     if (
         tool.schema_version != 4
-        or tool.delivery_profile_id != "workspace_bundle_v1"
+        or not is_workspace_profile(tool.delivery_profile_id)
         or tool.workspace_contract is None
     ):
         raise ValueError("WORKSPACE_PROFILE_REQUIRED")
@@ -1720,6 +1869,9 @@ def _run_workspace_reference_candidate(
 ) -> dict[str, object]:
     """Build one expected workspace in an offline, disposable reference root."""
 
+    import secrets
+    import shutil
+
     from repoproof.adoption.delivery.portable_workspace_runtime import (
         WorkspaceRuntimeError,
         seal_offline_python_runtime,
@@ -1729,6 +1881,14 @@ def _run_workspace_reference_candidate(
         offline_sandbox_argv,
         sanitised_subprocess_env,
     )
+    from repoproof.execution.open_api_replay import (
+        BASE_URLS_ENV,
+        CANARY_ENV,
+        MANIFEST_FILENAME,
+        RESPONSES_DIRNAME,
+        ReplayServer,
+        base_urls_env,
+    )
     from repoproof.execution.workspace_bundle import (
         WorkspaceBundleError,
         snapshot_admitted_path,
@@ -1737,6 +1897,14 @@ def _run_workspace_reference_candidate(
 
     if expected_dir.exists() or expected_dir.is_symlink():
         raise WorkspaceBundleError("WORKSPACE_EXPECTED_DESTINATION_EXISTS")
+    # An open-API workspace never reaches its hosts here: the fixture's recorded
+    # responses are replayed on 127.0.0.1, the sandbox opens that one port, and
+    # the producer sees the input *without* the recordings — the only way to the
+    # data is the same path the user's run takes, through the declared hosts.
+    open_api_hosts = tuple(getattr(contract, "open_api_hosts", ()) or ())
+    responses_dir = Path(input_path) / RESPONSES_DIRNAME
+    replay: ReplayServer | None = None
+    canary: str | None = None
     with tempfile.TemporaryDirectory(prefix="rp-workspace-reference-") as temp:
         root = Path(temp)
         source_parent_fd = _open_absolute_directory(reference_source.parent)
@@ -1751,7 +1919,28 @@ def _run_workspace_reference_candidate(
         runner.write_text(_WORKSPACE_REFERENCE_RUNNER, encoding="utf-8")
         runner.chmod(0o400)
         admitted_input = root / "input"
-        snapshot_admitted_path(input_path, admitted_input)
+        if open_api_hosts:
+            if not (responses_dir.is_dir() and (responses_dir / MANIFEST_FILENAME).is_file()):
+                raise WorkspaceBundleError(
+                    "WORKSPACE_REFERENCE_RESPONSES_MISSING",
+                    RESPONSES_DIRNAME,
+                    diagnostics=(
+                        f"an open-API fixture must carry {RESPONSES_DIRNAME}/{MANIFEST_FILENAME} "
+                        "with the recorded responses for every declared host",
+                    ),
+                )
+            view_source = root / "input-view"
+            shutil.copytree(
+                input_path,
+                view_source,
+                symlinks=False,
+                ignore=shutil.ignore_patterns(RESPONSES_DIRNAME),
+            )
+            snapshot_admitted_path(view_source, admitted_input)
+            canary = secrets.token_hex(16)
+            replay = ReplayServer(responses_dir, canary=canary).start()
+        else:
+            snapshot_admitted_path(input_path, admitted_input)
         output = root / "output"
         argv = [
             python_exe,
@@ -1761,19 +1950,31 @@ def _run_workspace_reference_candidate(
             str(output),
         ]
         try:
-            argv = offline_sandbox_argv(argv, root)
+            # The offline path keeps its exact historical call; only an open-API
+            # run asks the sandbox for the one replay port.
+            argv = (
+                offline_sandbox_argv(argv, root, loopback_port=replay.port)
+                if replay is not None
+                else offline_sandbox_argv(argv, root)
+            )
         except OfflineSandboxUnavailable as exc:
+            if replay is not None:
+                replay.stop()
             raise WorkspaceBundleError(
                 "WORKSPACE_REFERENCE_ISOLATION_UNAVAILABLE"
             ) from exc
+        # The producer stands in for the user's own run: bytecode is written,
+        # so a producer that imports a file it just wrote into the delivery is
+        # caught by structure validation before freeze.
+        env = sanitised_subprocess_env(root, [str(upstream_dir)], write_bytecode=True)
+        if replay is not None and canary is not None:
+            env.update(base_urls_env(replay, open_api_hosts))
+            env[CANARY_ENV] = canary
         try:
             process = subprocess.run(  # noqa: S603 - fixed argv, no shell
                 argv,
                 cwd=root,
-                # The producer stands in for the user's own run: bytecode is
-                # written, so a producer that imports a file it just wrote into
-                # the delivery is caught by structure validation before freeze.
-                env=sanitised_subprocess_env(root, [str(upstream_dir)], write_bytecode=True),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
@@ -1783,6 +1984,14 @@ def _run_workspace_reference_candidate(
             raise WorkspaceBundleError("WORKSPACE_REFERENCE_TIMEOUT") from exc
         except OSError as exc:
             raise WorkspaceBundleError("WORKSPACE_REFERENCE_START_FAILED") from exc
+        finally:
+            if replay is not None:
+                replay.stop()
+        no_request_hint = (
+            f"OPEN_API_NO_REQUEST_OBSERVED: the reference never reached the replay server; "
+            f"it must read {BASE_URLS_ENV} and send every request to the base URL mapped "
+            f"for its host instead of the public host itself"
+        )
         if process.returncode != 0:
             structured: dict[str, str] | None = None
             for line in reversed(process.stderr.splitlines()):
@@ -1815,11 +2024,77 @@ def _run_workspace_reference_candidate(
                 structured["failure_kind"],
                 "WORKSPACE_REFERENCE_PROCESS_FAILED",
             )
+            failure_diagnostics: tuple[str, ...] = (
+                structured["exception_type"],
+                structured["location"],
+            )
+            if replay is not None and not replay.ledger:
+                failure_diagnostics = (*failure_diagnostics, no_request_hint)
+            disagreement = _open_api_run_verdict(
+                replay, process_failed=True, crash_words=failure_diagnostics
+            )
+            if disagreement is not None:
+                raise disagreement
             raise WorkspaceBundleError(
                 code,
                 structured["exception_type"],
-                diagnostics=(structured["exception_type"], structured["location"]),
+                diagnostics=failure_diagnostics,
             )
+        if replay is not None and canary is not None:
+            leaks = replay.canary_leaks()
+            if leaks:
+                row = leaks[0]
+                raise WorkspaceBundleError(
+                    "WORKSPACE_REFERENCE_CREDENTIAL_LEAK",
+                    "request",
+                    diagnostics=(
+                        f"the sealed environment's canary token was sent to {row['host']}{row['path']}; "
+                        "a tool never forwards environment secrets to the hosts it reads",
+                    ),
+                )
+            for produced in sorted(output.rglob("*")):
+                if produced.is_file() and canary.encode("utf-8") in produced.read_bytes():
+                    raise WorkspaceBundleError(
+                        "WORKSPACE_REFERENCE_CREDENTIAL_LEAK",
+                        "output",
+                        diagnostics=(
+                            f"the sealed environment's canary token was written into "
+                            f"{produced.relative_to(output).as_posix()}; outputs never carry "
+                            "environment secrets",
+                        ),
+                    )
+            disagreement = _open_api_run_verdict(replay, process_failed=False, crash_words=())
+            if disagreement is not None:
+                raise disagreement
+            if not replay.ledger:
+                raise WorkspaceBundleError(
+                    "WORKSPACE_REFERENCE_NO_API_CALLS",
+                    ",".join(open_api_hosts),
+                    diagnostics=(no_request_hint,),
+                )
+            # The other direction of the same agreement: a recording the
+            # producer never asks for is not evidence the judge may recompute
+            # from (incident-recording-nobody-requested-becomes-the-judges-truth-*).
+            from repoproof.execution.open_api_replay import unused_recording_keys
+
+            try:
+                recorded_rows = json.loads(
+                    (responses_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
+                ).get("responses") or []
+            except (OSError, ValueError, AttributeError):
+                recorded_rows = []
+            unused = unused_recording_keys(recorded_rows, replay.ledger)
+            if unused:
+                raise WorkspaceBundleError(
+                    "WORKSPACE_REFERENCE_UNUSED_RECORDING",
+                    unused[0],
+                    diagnostics=(
+                        f"{len(unused)} recording(s) the producer never requested: " + "; ".join(unused[:8]),
+                        "requests and recordings must agree both ways — the judge recomputes only from "
+                        "bodies the producer can reach; either the producer discovers and requests these "
+                        "keys (through the bodies it does fetch) or the builder does not record them",
+                    ),
+                )
         if contract.require_offline_wheelhouse:
             if runtime_wheelhouse is None or runtime_lock is None:
                 raise WorkspaceBundleError("WORKSPACE_RUNTIME_SOURCE_MISSING")
@@ -1896,11 +2171,42 @@ def _freeze_draft_runtime_wheelhouse(
     return destination
 
 
+_FRESH_PROBE_FILENAME = "fresh_probe_blueprints.json"
+
+
+def _fresh_probe_scenarios(draft_dir: Path) -> list[dict] | None:
+    """The fresh-input scenarios one self-check already proposed, if any."""
+
+    path = Path(draft_dir) / _FRESH_PROBE_FILENAME
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    rows = document.get("blueprints") if isinstance(document, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else None
+
+
+def _remember_fresh_probe_scenarios(draft_dir: Path, rows: list[dict]) -> None:
+    """One self-check, one fresh scenario set: evidence must stay comparable across repairs.
+
+    Re-proposing every round changed the identifiers in every failure line,
+    which hid a stalled repair from the stall budget and the ineffective-owner
+    detector (incident-fresh-probe-scenarios-drift-and-input-insufficient-routing-*).
+    """
+
+    from repoproof.execution.core_execution import atomic_write_json
+
+    atomic_write_json(Path(draft_dir) / _FRESH_PROBE_FILENAME, {"schema_version": 1, "blueprints": list(rows)})
+
+
 def propose_workspace_fixture_candidates(
     draft_dir: Path,
     *,
     n: int,
     offline: bool,
+    fresh_scenarios: list[dict] | None = None,
 ) -> dict:
     """Materialise model-authored scenarios through one frozen task builder.
 
@@ -1924,7 +2230,12 @@ def propose_workspace_fixture_candidates(
         FixtureBuilderError,
         InputFixtureCandidateV1,
         assert_distinct_fixture_inputs,
+        assert_frontend_assets_from_upstream,
+        assert_pdf_shows_input_script,
+        assert_recordings_avoid_known_boundaries,
+        assert_recordings_well_formed,
         build_fixture_candidate,
+        input_text_samples,
     )
     from repoproof.execution.core_execution import atomic_write_json
     from repoproof.execution.workspace_bundle import WorkspaceBundleError
@@ -1934,10 +2245,35 @@ def propose_workspace_fixture_candidates(
         return {"ok": False, "error": path_error}
     draft_dir = checked_dir
     generation_root: Path | None = None
+    # The scenarios the model proposed, kept for the failure result too: a
+    # failed probe is exactly the round whose evidence must stay comparable
+    # (incident-fresh-probe-scenarios-not-remembered-on-failure-*).
+    proposed_rows: list[dict[str, object]] = []
+    # The candidate under dispute when a round fails: every repair must argue
+    # about *this* input and *this* output, not the first blueprint's
+    # (incident-repairs-blind-to-the-disputed-candidate-*).
+    disputed_blueprint: FixtureBlueprintV1 | None = None
+    disputed_expected_dir: Path | None = None
     try:
         draft = yaml.safe_load((draft_dir / "draft.yaml").read_text(encoding="utf-8")) or {}
         if not isinstance(draft, dict):
             raise TypeError("draft.yaml root")
+        # Supply before semantics: a missing lock is a fact about the pinned
+        # tree, answerable (and located) before any semantic fingerprint.
+        lock_text = resolved_dependency_lock(
+            draft,
+            draft_dir,
+            project_root=_product_root(),
+        )
+        if not lock_text:
+            return {
+                "ok": False,
+                "error": "固定上游依赖锁尚未成立；本次没有调用模型。",
+                "failure_owner": "HARNESS",
+                "reason_codes": ["DEPENDENCY_LOCK_MISSING"],
+                "diagnostics": [_missing_lock_diagnostic(draft)],
+                "recommended_action": "先补齐精确依赖锁，再生成真实目录样例。",
+            }
         draft_semantics_sha256 = _current_draft_semantic_fingerprint(draft)
         readiness = _core_draft_readiness(draft, draft_dir)
         if not readiness.compatible or not readiness.current:
@@ -1954,7 +2290,12 @@ def propose_workspace_fixture_candidates(
             raise ValueError("WORKSPACE_FIXTURE_BLUEPRINTS_INVALID")
         blueprints = [FixtureBlueprintV1.model_validate(item) for item in rows]
         requested = max(1, min(int(n), 4))
-        if offline:
+        if fresh_scenarios is not None:
+            # Scenarios this self-check already proposed: materialise the same
+            # ones again instead of asking the model for new identifiers.
+            selected = [FixtureBlueprintV1.model_validate(item) for item in fresh_scenarios][:requested]
+            drafter_name = "fresh-probe-remembered"
+        elif offline:
             selected = blueprints[:requested]
             drafter_name = "frozen-draft-blueprints"
         else:
@@ -1997,6 +2338,7 @@ def propose_workspace_fixture_candidates(
             drafter_name = getattr(drafter, "name", type(drafter).__name__)
         if not selected:
             raise ValueError("WORKSPACE_FIXTURE_BLUEPRINTS_EMPTY")
+        proposed_rows = [item.model_dump(mode="json") for item in selected]
         upstream, upstream_error = _draft_upstream_dir(draft_dir)
         if upstream is None:
             return {
@@ -2004,19 +2346,6 @@ def propose_workspace_fixture_candidates(
                 "error": upstream_error,
                 "failure_owner": "HARNESS",
                 "reason_codes": ["PINNED_UPSTREAM_UNAVAILABLE"],
-            }
-        lock_text = resolved_dependency_lock(
-            draft,
-            draft_dir,
-            project_root=_product_root(),
-        )
-        if not lock_text:
-            return {
-                "ok": False,
-                "error": "固定上游依赖锁尚未成立；本次没有调用模型。",
-                "failure_owner": "HARNESS",
-                "reason_codes": ["DEPENDENCY_LOCK_MISSING"],
-                "recommended_action": "先补齐精确依赖锁，再生成真实目录样例。",
             }
         generation_id = f"generation-{int(time.time())}-{secrets.token_hex(4)}"
         generation_root = draft_dir / "workspace-candidates" / generation_id
@@ -2044,7 +2373,9 @@ def propose_workspace_fixture_candidates(
                     draft_dir=draft_dir,
                     admitted_wheelhouse=admitted,
                 )
+            known_boundaries = known_boundaries_for_draft(draft_dir)
             for blueprint in selected:
+                disputed_blueprint = blueprint
                 candidate = build_fixture_candidate(
                     blueprint=blueprint,
                     builder_id="task-fixture-builder-v1",
@@ -2052,6 +2383,14 @@ def propose_workspace_fixture_candidates(
                     fixture_root=generation_root / "inputs",
                     python_exe=reference_python,
                     isolation_required=True,
+                )
+                # Supply before semantics: a recording the builder wrote badly
+                # is refused here, before any producer is blamed for it.
+                assert_recordings_well_formed(Path(candidate.fixture_path), fixture_id=blueprint.blueprint_id)
+                # A wall the rehearsal already proved stays a wall when the
+                # builder's *code* (not a blueprint row) recorded the endpoint.
+                assert_recordings_avoid_known_boundaries(
+                    Path(candidate.fixture_path), known_boundaries, fixture_id=blueprint.blueprint_id
                 )
                 input_candidates.append(candidate)
             # Identity/admission checks precede every expensive reference or
@@ -2063,6 +2402,7 @@ def propose_workspace_fixture_candidates(
                 selected, input_candidates, strict=True
             ):
                 expected_dir = generation_root / "expected" / blueprint.blueprint_id
+                disputed_blueprint, disputed_expected_dir = blueprint, expected_dir
                 expected = _run_workspace_reference_candidate(
                     reference_source=draft_dir / "reference_impl.py",
                     input_path=Path(candidate.fixture_path),
@@ -2073,6 +2413,18 @@ def propose_workspace_fixture_candidates(
                     runtime_wheelhouse=runtime_wheelhouse,
                     runtime_lock=runtime_lock,
                 )
+                # A delivered front-end library must be one the pinned upstream
+                # ships; otherwise the interactive form is a boundary to propose.
+                assert_frontend_assets_from_upstream(expected_dir, upstream)
+                # A PDF must be able to show the user's own text; core fonts
+                # alone cannot, and no font can be fetched — a boundary too.
+                pdf_files = sorted(p for p in expected_dir.rglob("*.pdf") if p.is_file())
+                if pdf_files:
+                    samples = input_text_samples(Path(candidate.fixture_path))
+                    for pdf_file in pdf_files:
+                        assert_pdf_shows_input_script(
+                            pdf_file, samples, relative=pdf_file.relative_to(expected_dir).as_posix()
+                        )
                 if blueprint is selected[0] and contract.runnable and contract.smoke_command:
                     # The contract's own smoke command is part of the ruler too
                     # (preflight runs it after freeze); run it here, on the first
@@ -2160,9 +2512,7 @@ def propose_workspace_fixture_candidates(
                         isolation_required=True,
                     )
                 except SemanticVerifierError as exc:
-                    raise WorkspaceBundleError(
-                        "WORKSPACE_SEMANTIC_SCREEN_EXECUTION_FAILED"
-                    ) from exc
+                    raise _semantic_screen_failure(exc) from exc
                 if not semantic.passed:
                     details = dict(getattr(semantic, "reason_details", {}) or {})
                     raise WorkspaceBundleError(
@@ -2201,6 +2551,7 @@ def propose_workspace_fixture_candidates(
             "records": records,
         }
         atomic_write_json(draft_dir / _WORKSPACE_FIXTURE_STATE, state)
+        _clear_disputed_candidate(draft_dir)
         public_records: list[dict[str, object]] = []
         for record in records:
             public_records.append(
@@ -2234,6 +2585,7 @@ def propose_workspace_fixture_candidates(
             "shortfall": max(0, requested - len(public_records)),
             "offline": bool(offline),
             "generation_id": generation_id,
+            "blueprints": [item.model_dump(mode="json") for item in selected],
             "candidates": public_records,
         }
     except (
@@ -2248,17 +2600,30 @@ def propose_workspace_fixture_candidates(
         json.JSONDecodeError,
         yaml.YAMLError,
     ) as exc:
+        code, projected = _workspace_fixture_public_code(exc)
+        failure_owner = _workspace_fixture_failure_owner(code)
+        # The exception's own diagnostics stay exactly as they were; the
+        # projected words only fill the silence a bare exception would leave.
+        diagnostics = list(_workspace_bundle_error_diagnostics(exc)) or projected
+        if disputed_blueprint is not None:
+            # Which candidate, and what the producer made of it — pinned while
+            # the generation tree still exists, read after it is gone.
+            diagnostics.append(_disputed_blueprint_row(disputed_blueprint.blueprint_id))
+            _record_disputed_candidate(
+                draft_dir,
+                blueprint_id=disputed_blueprint.blueprint_id,
+                reason_code=code,
+                expected_dir=disputed_expected_dir,
+            )
         if generation_root is not None:
             shutil.rmtree(generation_root, ignore_errors=True)
-        code = str(getattr(exc, "code", "") or str(exc) or type(exc).__name__.upper())
-        failure_owner = _workspace_fixture_failure_owner(code)
-        diagnostics = _workspace_bundle_error_diagnostics(exc)
         return {
             "ok": False,
             "error": f"目录样例生成失败：{code}",
             "failure_owner": failure_owner,
             "reason_codes": [code],
             "diagnostics": diagnostics,
+            "blueprints": proposed_rows,
             "recommended_action": (
                 (
                     "冻结前的合同、fixture 或 reference 不可执行；修正公共语义并创建新的任务版本，"
@@ -2359,11 +2724,15 @@ def _workspace_fixture_failure_owner(code: str) -> str:
 
     contract_owned = (
         code.startswith("FIXTURE_")
+        or code.startswith("FRONTEND_ASSET_")
+        or code.startswith("PDF_CANNOT_RENDER_")
+        or code.startswith("OPEN_API_HOSTS_")
         or code.startswith("WORKSPACE_CONTRACT_")
         or code.startswith("WORKSPACE_REFERENCE_EXECUTION_")
         or code.startswith("WORKSPACE_REFERENCE_NOT_REPRODUCIBLE")
         or code.startswith("WORKSPACE_REFERENCE_SMOKE_")
         or code.startswith("WORKSPACE_REFERENCE_FIXTURE_")
+        or code.startswith("WORKSPACE_REFERENCE_UNUSED_")
         or code.startswith("WORKSPACE_REFERENCE_PROTOCOL_")
         or code.startswith("WORKSPACE_REFERENCE_DEPENDENCY_")
         or code.startswith("WORKSPACE_REFERENCE_VERIFIER_")
@@ -2695,7 +3064,7 @@ def _validated_installed_workspace_artifact(
         raise ValueError("PACKAGE_IDENTITY_UNHEALTHY")
     if entry.get("operational_status") != "ACTIVE":
         raise ValueError("WORKSPACE_TOOL_NOT_ACTIVE")
-    if entry.get("delivery_profile_id") != "workspace_bundle_v1":
+    if not is_workspace_profile(entry.get("delivery_profile_id")):
         raise ValueError("WORKSPACE_PROFILE_REQUIRED")
     package = Path(str(entry.get("path") or ""))
     if package.resolve() != canonical_tool_path(checked_root, name).resolve():
@@ -3459,9 +3828,7 @@ def _screen_frozen_workspace_candidate_semantics(
             isolation_required=True,
         )
     except (OSError, ValueError, SemanticVerifierError) as exc:
-        raise WorkspaceBundleError(
-            "WORKSPACE_SEMANTIC_SCREEN_EXECUTION_FAILED"
-        ) from exc
+        raise _semantic_screen_failure(exc) from exc
     if not evidence.passed:
         raise WorkspaceBundleError(
             "WORKSPACE_REFERENCE_VERIFIER_SEMANTIC_DISAGREEMENT",
@@ -3510,6 +3877,7 @@ def _propose_workspace_audit_candidates(
         build_fixture_candidate,
     )
     from repoproof.execution.core_execution import atomic_write_json
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME
     from repoproof.execution.workspace_bundle import (
         WorkspaceBundleError,
         identify_input_path,
@@ -3520,7 +3888,7 @@ def _propose_workspace_audit_candidates(
     if (
         tool is None
         or tool.schema_version != 4
-        or tool.delivery_profile_id != "workspace_bundle_v1"
+        or not is_workspace_profile(tool.delivery_profile_id)
         or tool.workspace_contract is None
     ):
         return {
@@ -3635,7 +4003,20 @@ def _propose_workspace_audit_candidates(
                     python_exe=reference_python,
                     isolation_required=True,
                 )
-                if candidate.fixture_identity.sha256 in existing_input_hashes:
+                # Open-API tools are audited on what the world served today:
+                # the builder's synthetic bodies are replaced row by row with
+                # live answers (a row that cannot be refreshed stays synthetic
+                # and is reported), then the frozen producer and judge run.
+                live_recording: dict[str, object] | None = None
+                fixture_identity = candidate.fixture_identity
+                audit_hosts = tuple(tool.workspace_contract.open_api_hosts)
+                recorded = Path(candidate.fixture_path) / RESPONSES_DIRNAME
+                if audit_hosts and recorded.is_dir():
+                    from repoproof.runner.open_api_rehearsal import refresh_recording_live
+
+                    live_recording = refresh_recording_live(recorded, hosts=audit_hosts)
+                    fixture_identity = identify_input_path(Path(candidate.fixture_path))
+                if fixture_identity.sha256 in existing_input_hashes:
                     return None
                 expected_dir = generation_root / "expected" / blueprint.blueprint_id
                 expected = _run_workspace_reference_candidate(
@@ -3663,9 +4044,10 @@ def _propose_workspace_audit_candidates(
                     "input_kind": blueprint.input_kind,
                     "builder_source_sha256": candidate.builder_source_sha256,
                     "input_path": candidate.fixture_path,
-                    "input_sha256": candidate.fixture_identity.sha256,
-                    "input_file_count": candidate.fixture_identity.file_count,
-                    "input_total_bytes": candidate.fixture_identity.total_bytes,
+                    "input_sha256": fixture_identity.sha256,
+                    "input_file_count": fixture_identity.file_count,
+                    "input_total_bytes": fixture_identity.total_bytes,
+                    "live_recording": live_recording,
                     "expected_dir": str(expected_dir.resolve()),
                     "expected_tree_sha256": expected["tree_sha256"],
                     "expected_file_count": expected["file_count"],
@@ -3708,7 +4090,7 @@ def _propose_workspace_audit_candidates(
             "task_id": task_id,
             "dest_root": str(checked_root),
             "artifact_kind": "directory",
-            "delivery_profile_id": "workspace_bundle_v1",
+            "delivery_profile_id": str(tool.delivery_profile_id or "workspace_bundle_v1"),
             "drafter": drafter_name,
             "candidates": [
                 {
@@ -3751,13 +4133,13 @@ def _propose_workspace_audit_candidates(
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        code = str(getattr(exc, "code", str(exc) or type(exc).__name__))
+        code, projected = _workspace_fixture_public_code(exc)
         # The verifier's own reason codes/details travel with a disagreement;
         # a bare code told nobody what the frozen judge objected to
         # (incident-frozen-controls-disagree-on-fresh-input-*).
         detail_rows = [
             str(item) for item in (getattr(exc, "diagnostics", ()) or ()) if str(item) and str(item) != code
-        ][:8]
+        ][:8] or [row for row in projected if row != code][:8]
         owner = (
             "CONTRACT"
             if code
@@ -3834,7 +4216,7 @@ def _load_workspace_audit_candidate(
     if (
         tool is None
         or tool.schema_version != 4
-        or tool.delivery_profile_id != "workspace_bundle_v1"
+        or not is_workspace_profile(tool.delivery_profile_id)
         or tool.workspace_contract is None
     ):
         raise ValueError("WORKSPACE_PROFILE_REQUIRED")
@@ -4134,7 +4516,7 @@ def propose_audit_candidates(
         if (
             contract_tool is not None
             and contract_tool.schema_version == 4
-            and contract_tool.delivery_profile_id == "workspace_bundle_v1"
+            and is_workspace_profile(contract_tool.delivery_profile_id)
         ):
             return _propose_workspace_audit_candidates(
                 name=name,
@@ -4557,7 +4939,7 @@ def start_tool_audit(
         workspace_profile = bool(
             isinstance(manifest, dict)
             and manifest.get("contract_schema_version") == 4
-            and manifest.get("delivery_profile_id") == "workspace_bundle_v1"
+            and is_workspace_profile(manifest.get("delivery_profile_id"))
         )
     except (OSError, UnicodeError, ValueError):
         return {"ok": False, "error": "无法确认已安装工具的交付 profile。"}
@@ -5730,7 +6112,7 @@ def _repair_draft_controls_after_contract_mismatch(
         raise _CandidateAdmissionError(
             owner="CONTRACT",
             reason_codes=["DEPENDENCY_LOCK_MISSING"],
-            message="草稿依赖锁无法从用户文件或钉版上游事实中解析。",
+            message="草稿依赖锁无法从用户文件或钉版上游事实中解析。" + _missing_lock_diagnostic(overview_doc),
         )
     current_reference = reference_path.read_text(encoding="utf-8")
     current_verifier = verifier_path.read_text(encoding="utf-8")
@@ -6159,7 +6541,7 @@ def propose_example_candidates(draft_dir: Path, *, n: int, offline: bool) -> dic
             raise _CandidateAdmissionError(
                 owner="HARNESS",
                 reason_codes=["DEPENDENCY_LOCK_MISSING"],
-                message=("固定上游依赖锁尚未成立；候选生成已在模型调用前停止。"),
+                message="固定上游依赖锁尚未成立；候选生成已在模型调用前停止。" + _missing_lock_diagnostic(overview_doc),
             )
         reference_python = stack.enter_context(
             prepared_reference_environment(
@@ -6699,8 +7081,13 @@ def _discrimination_gap_diagnostics(probe) -> tuple[str, ...]:
             continue
         outcomes: dict[str, list[str]] = {}
         for mutation in mutations:
+            kind = str(getattr(mutation, "kind", ""))
+            excerpt = str(getattr(mutation, "excerpt", "") or "")
+            # The line itself, not just its number: the judge's bounded
+            # observation may end long before line 71
+            # (incident-discrimination-gap-names-unseen-lines-*).
             outcomes.setdefault(str(getattr(mutation, "result", "")), []).append(
-                str(getattr(mutation, "kind", ""))
+                f'{kind} ("{excerpt}")' if excerpt else kind
             )
         parts = [
             f"{result}: {', '.join(sorted(set(kinds)))}"
@@ -6745,11 +7132,404 @@ def _protocol_focus_paths(
     return tuple(focus)
 
 
+def _failure_key(check) -> tuple[str, str]:
+    """(code, first sub-diagnostic token): the failure a repair sequence is about.
+
+    The disagreement code covers many different findings; when the finding
+    changes, the owner sequence starts over with the judge
+    (incident-disagreement-sequence-not-reset-*).  Codes without
+    sub-diagnostics keep counting by code alone.
+    """
+
+    code = str(check.reason_codes[0]) if check.reason_codes else ""
+    if code != "WORKSPACE_REFERENCE_VERIFIER_SEMANTIC_DISAGREEMENT":
+        return (code, "")
+    first = str(check.diagnostics[0]) if check.diagnostics else ""
+    return (code, first.split(":", 1)[0].strip())
+
+
+def _same_failure_repairs(rounds, check) -> int:
+    key = _failure_key(check)
+    return sum(1 for previous in rounds if previous.repair is not None and _failure_key(previous) == key)
+
+
+# Failures that are disputes about the input fixture itself: the repair on
+# either side must see that input, not only the other side's words.
+_INPUT_DISPUTE_CODES = frozenset(
+    {
+        "WORKSPACE_REFERENCE_FIXTURE_REJECTED",
+        "WORKSPACE_REFERENCE_EXECUTION_FAILED",
+        "WORKSPACE_REFERENCE_UNRECORDED_REQUEST",
+        "WORKSPACE_REFERENCE_UNUSED_RECORDING",
+        # Two readings of the same configuration are a dispute about that
+        # configuration as much as about the code
+        # (incident-disagreement-repairs-blind-to-the-input-*).
+        "WORKSPACE_REFERENCE_VERIFIER_SEMANTIC_DISAGREEMENT",
+    }
+)
+
+
+def _excerpt_targets_for(code: str) -> tuple[str, ...]:
+    if code == "WORKSPACE_REFERENCE_VERIFIER_SEMANTIC_DISAGREEMENT":
+        return ("reference", "builder", "verifier", "contract")
+    return ("reference", "builder")
+
+
+def _fixture_excerpt_for_draft(draft_dir: Path, *, blueprint_id: str | None = None) -> dict[str, object]:
+    """Materialise one blueprint with the draft's builder and describe the input it makes.
+
+    The blueprint named (the one under dispute, frozen or fresh-probe) or else
+    the first.  File listing plus the head of each text file, bounded; the
+    candidate directories are gone by repair time
+    (incident-fixture-rejection-repairs-blind-to-the-input-*,
+    incident-repairs-blind-to-the-disputed-candidate-*).
+    """
+
+    import sys
+    import tempfile
+
+    from repoproof.adoption.intake.workspace_fixtures import FixtureBlueprintV1, build_fixture_candidate
+
+    draft_dir = Path(draft_dir)
+    builder = draft_dir / "fixture_builder.py"
+    blueprints: list[FixtureBlueprintV1] = []
+    for filename in ("fixture_blueprints.json", _FRESH_PROBE_FILENAME):
+        path = draft_dir / filename
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            rows = document.get("blueprints") if isinstance(document, dict) else None
+            blueprints.extend(FixtureBlueprintV1.model_validate(item) for item in (rows or []))
+        except (OSError, ValueError, TypeError):
+            if filename == "fixture_blueprints.json":
+                return {}
+    if not builder.is_file() or not blueprints:
+        return {}
+    blueprint = next((item for item in blueprints if item.blueprint_id == blueprint_id), blueprints[0])
+    with tempfile.TemporaryDirectory(prefix="repoproof-fixture-excerpt-") as temp:
+        try:
+            candidate = build_fixture_candidate(
+                blueprint=blueprint,
+                builder_id="fixture-excerpt-probe",
+                builder_source=builder,
+                fixture_root=Path(temp) / blueprint.blueprint_id,
+                python_exe=sys.executable,
+                isolation_required=False,
+            )
+        except Exception:  # noqa: BLE001 - a builder that cannot run has its own failure path
+            return {}
+        root = Path(candidate.fixture_path)
+        files: list[str] = []
+        heads: dict[str, str] = {}
+        budget = 4000
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith("__responses__/"):
+                continue
+            files.append(rel)
+            if len(files) >= 40:
+                break
+            if budget <= 0 or path.stat().st_size > 200_000:
+                continue
+            try:
+                raw = path.read_bytes()
+                if b"\x00" in raw[:4096]:
+                    continue  # binary: listed, never excerpted
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            head = "\n".join(text.splitlines()[:40])[:1200]
+            heads[rel] = head
+            budget -= len(head)
+        recorded = _manifest_request_keys(root)
+    parameters = json.dumps(blueprint.parameters, ensure_ascii=False, sort_keys=True)
+    return {
+        "blueprint_id": blueprint.blueprint_id,
+        # The parameters the builder derived these bytes from: a builder repair
+        # that only sees the empty file it produced cannot know what it missed.
+        "parameters": parameters[:1500],
+        "files": files,
+        "text_heads": heads,
+        # The request keys this fixture really records (no bodies): an
+        # unrecorded-request dispute that only names the first key the
+        # producer hit ping-pongs between hosts for rounds
+        # (incident-repairs-blind-to-the-disputed-candidate-*).
+        "recorded_requests": recorded,
+    }
+
+
+def _manifest_request_keys(fixture_root: Path) -> list[str]:
+    from repoproof.adoption.intake.workspace_fixtures import manifest_request_keys
+
+    return manifest_request_keys(fixture_root)
+
+
+_DISPUTED_CANDIDATE_FILENAME = "disputed_candidate.json"
+_DISPUTED_BLUEPRINT_PREFIX = "DISPUTED_BLUEPRINT: "
+
+
+def _disputed_blueprint_row(blueprint_id: str) -> str:
+    return f"{_DISPUTED_BLUEPRINT_PREFIX}{blueprint_id}"
+
+
+def _disputed_blueprint_id(diagnostics: tuple[str, ...] | list[str]) -> str | None:
+    """The blueprint a failing round named, if it named one."""
+
+    for row in diagnostics:
+        text = str(row)
+        if text.startswith(_DISPUTED_BLUEPRINT_PREFIX):
+            return text[len(_DISPUTED_BLUEPRINT_PREFIX):].strip() or None
+    return None
+
+
+def _output_observation(expected_dir: Path, *, excluded: tuple[str, ...] = ()) -> list[dict[str, object]]:
+    """Provenance-safe rows about one produced tree (paths, sizes, bounded text, zip members)."""
+
+    from fnmatch import fnmatch
+
+    files: list[dict[str, object]] = []
+    if not expected_dir.is_dir():
+        return files
+    budget = _OBSERVATION_TOTAL_CHARS
+    for path in sorted(expected_dir.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(expected_dir).as_posix()
+        if any(fnmatch(relative, pattern) for pattern in excluded):
+            continue
+        payload = path.read_bytes()
+        row: dict[str, object] = {"path": relative, "bytes": len(payload), "first_line": ""}
+        row.update(_observe_artifact_payload(payload, budget=budget))
+        budget -= len(str(row.get("excerpt") or "")) + sum(
+            len(head) for head in (row.get("zip_text_heads") or {}).values()
+        )
+        files.append(row)
+        if len(files) >= 40:
+            break
+    return files
+
+
+def _record_disputed_candidate(
+    draft_dir: Path, *, blueprint_id: str, reason_code: str, expected_dir: Path | None
+) -> None:
+    """Pin the candidate a failing round disputed, with what the producer made of it.
+
+    Written while the generation tree still exists; the repair reads it after
+    the tree is gone.  The verifier's observation once came from the state
+    file — written only on success — so the judge was repaired against nothing
+    (incident-repairs-blind-to-the-disputed-candidate-*).
+    """
+
+    from repoproof.execution.core_execution import atomic_write_json
+
+    files = _output_observation(Path(expected_dir)) if expected_dir is not None else []
+    atomic_write_json(
+        Path(draft_dir) / _DISPUTED_CANDIDATE_FILENAME,
+        {
+            "schema_version": 1,
+            "blueprint_id": blueprint_id,
+            "reason_code": reason_code,
+            "output_observation": {
+                "files": files,
+                "note": (
+                    "paths, sizes, first text line, a bounded text excerpt, zip member names "
+                    "and text-member heads of what the reference produced for the disputed blueprint"
+                ),
+            },
+        },
+    )
+
+
+def _clear_disputed_candidate(draft_dir: Path) -> None:
+    path = Path(draft_dir) / _DISPUTED_CANDIDATE_FILENAME
+    if path.is_file() and not path.is_symlink():
+        path.unlink()
+
+
+def _disputed_candidate(draft_dir: Path) -> dict[str, object] | None:
+    path = Path(draft_dir) / _DISPUTED_CANDIDATE_FILENAME
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or not str(document.get("blueprint_id") or ""):
+        return None
+    return document
+
+
+def known_boundaries_for_draft(draft_dir: Path) -> list[dict[str, object]]:
+    """The boundaries earlier rehearsals proved, as the drafter wrote them into the bundle."""
+
+    path = Path(draft_dir) / "known_boundaries.json"
+    if path.is_symlink() or not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = document.get("boundaries") if isinstance(document, dict) else None
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+_UPSTREAM_NAME_ERROR_RE = re.compile(
+    r"module '(?P<attr_module>[\w.]+)' has no attribute '(?P<attr>\w+)'"
+    r"|cannot import name '(?P<name>\w+)' from '(?P<name_module>[\w.]+)'"
+)
+_UPSTREAM_SURFACE_NAMES = 200
+
+
+def _upstream_module_named(diagnostics: tuple[str, ...] | list[str], import_module: str) -> str | None:
+    root = str(import_module or "").strip()
+    if not root:
+        return None
+    for row in diagnostics:
+        for match in _UPSTREAM_NAME_ERROR_RE.finditer(str(row)):
+            module = match.group("attr_module") or match.group("name_module") or ""
+            if module == root or module.startswith(root + "."):
+                return module
+    return None
+
+
+def upstream_module_surface(
+    diagnostics: tuple[str, ...] | list[str], upstream_dir: Path, import_module: str
+) -> dict[str, object] | None:
+    """The public names the pinned module really defines, when a diagnostic guessed one that is not there.
+
+    An AttributeError/ImportError naming an upstream module is answered from
+    the pinned tree, statically: top-level def/class names, bounded, no code
+    executed.  Repairs that only saw the error guessed a new name every round
+    (incident-upstream-attribute-guessing-*).
+    """
+
+    module = _upstream_module_named(diagnostics, import_module)
+    if module is None:
+        return None
+    parts = module.split(".")
+    relative = Path(*parts)
+    roots = [Path(upstream_dir), Path(upstream_dir) / "src"]
+    try:
+        roots.extend(sorted(p for p in Path(upstream_dir).iterdir() if p.is_dir() and not p.name.startswith(".")))
+    except OSError:
+        return None
+    source_path: Path | None = None
+    for root in roots:
+        for candidate in (root / relative.with_suffix(".py"), root / relative / "__init__.py"):
+            if candidate.is_file() and not candidate.is_symlink():
+                source_path = candidate
+                break
+        if source_path is not None:
+            break
+    if source_path is None:
+        return None
+    try:
+        tree = ast.parse(source_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)
+        elif isinstance(node, ast.Assign):
+            names.extend(t.id for t in node.targets if isinstance(t, ast.Name) and not t.id.startswith("_"))
+    return {
+        "module": module,
+        "source": source_path.relative_to(upstream_dir).as_posix(),
+        "names": names[:_UPSTREAM_SURFACE_NAMES],
+        "truncated": len(names) > _UPSTREAM_SURFACE_NAMES,
+    }
+
+
+def _upstream_surface_for_draft(
+    draft_dir: Path, draft: dict, diagnostics: tuple[str, ...] | list[str]
+) -> dict[str, object] | None:
+    import_module = str((draft.get("source_repo") or {}).get("import_module") or "")
+    if _upstream_module_named(diagnostics, import_module) is None:
+        return None
+    upstream, _error = _draft_upstream_dir(Path(draft_dir))
+    if upstream is None:
+        return None
+    return upstream_module_surface(diagnostics, upstream, import_module)
+
+
+def _open_api_hosts_gap(draft: dict) -> tuple[str, ...] | None:
+    """Diagnostics when an open-API draft declares no hosts; None otherwise.
+
+    A supply fact of the contract, answerable before any producer runs: the
+    sealed run maps only declared hosts to the stub, so with none every request
+    falls through to the real network and dies in DNS — five rounds of the same
+    URLError, all sent to the producer (incident-open-api-hosts-empty-selfcheck-blind-*).
+    """
+
+    from repoproof.adoption.delivery.product_profile import OPEN_API_WORKSPACE_PROFILE_ID
+
+    tool = draft.get("tool") if isinstance(draft, dict) else None
+    tool = tool if isinstance(tool, dict) else {}
+    profile = draft.get("_delivery_profile") if isinstance(draft, dict) else None
+    profile_id = str(
+        (profile.get("profile_id") if isinstance(profile, dict) else None)
+        or tool.get("delivery_profile_id")
+        or ""
+    )
+    raw = tool.get("delivery_requirements")
+    requirements = raw if isinstance(raw, dict) else {}
+    if profile_id != OPEN_API_WORKSPACE_PROFILE_ID and str(requirements.get("network") or "") != "open_api":
+        return None
+    raw_contract = tool.get("workspace_contract")
+    contract = raw_contract if isinstance(raw_contract, dict) else {}
+    hosts = contract.get("open_api_hosts")
+    if isinstance(hosts, list) and any(str(item).strip() for item in hosts):
+        return None
+    return (
+        "workspace_contract.open_api_hosts is empty: the sealed run maps only declared hosts to the "
+        "replay stub, so every producer request would leave the stub and fail in DNS; declare the "
+        "public hosts the fixtures record before any producer runs",
+    )
+
+
+def _import_module_gap(draft: dict) -> tuple[str, ...] | None:
+    """Diagnostics when the draft has no import module; None otherwise.
+
+    An empty import module is an intake fact (the package could not be
+    located) that used to travel unnoticed until a random validator far
+    downstream refused it (incident-import-module-unresolved-reaches-evidence-validator-*).
+    """
+
+    source = draft.get("source_repo") if isinstance(draft, dict) else None
+    if not isinstance(source, dict):
+        return None  # no intake section at all: nothing to claim about it
+    if str(source.get("import_module") or "").strip():
+        return None
+    meta = draft.get("_draft") if isinstance(draft, dict) else None
+    provenance = (meta.get("provenance") if isinstance(meta, dict) else None) or {}
+    why = str(provenance.get("import_module") or "") if isinstance(provenance, dict) else ""
+    return (
+        "source_repo.import_module is empty: the intake could not locate the importable package"
+        + (f" ({why})" if why else "")
+        + "; the sealed producer, the judge's receipts and the evidence record all need it — "
+        "confirm the package name (or pin a revision whose layout declares it) before any producer runs",
+    )
+
+
 def _self_check_round(draft_dir: Path, draft: dict, *, round_index: int):
     from repoproof.adoption.intake.draft_selfcheck import DraftSelfCheckRoundV1
     from repoproof.adoption.intake.tool_drafter import DraftError
     from repoproof.verification.semantic_artifact import SemanticVerifierError
 
+    for code, gap in (
+        ("OPEN_API_HOSTS_MISSING", _open_api_hosts_gap(draft)),
+        ("IMPORT_MODULE_UNRESOLVED", _import_module_gap(draft)),
+    ):
+        if gap is not None:
+            # Supply before semantics: no producer, judge or model call can answer this.
+            return DraftSelfCheckRoundV1(
+                round=round_index,
+                check_ok=False,
+                reason_codes=(code,),
+                diagnostics=gap,
+            )
     try:
         document = json.loads(
             (Path(draft_dir) / "fixture_blueprints.json").read_text(encoding="utf-8")
@@ -6768,7 +7548,14 @@ def _self_check_round(draft_dir: Path, draft: dict, *, round_index: int):
     try:
         # Two fresh scenarios: one agreed at self-check and the post-freeze audit
         # still split the controls on its own proposal (third incident).
-        fresh = propose_workspace_fixture_candidates(draft_dir, n=2, offline=False)
+        remembered = _fresh_probe_scenarios(draft_dir)
+        fresh = propose_workspace_fixture_candidates(
+            draft_dir, n=2, offline=False, fresh_scenarios=remembered
+        )
+        # Pinned whether or not the probe passed: the failing round is the one
+        # whose evidence the next repair must be able to compare against.
+        if remembered is None and fresh.get("blueprints"):
+            _remember_fresh_probe_scenarios(draft_dir, list(fresh["blueprints"]))
     except DraftError as exc:
         fresh = {"ok": True, "skipped": str(exc)}  # no online drafter: the probe cannot run offline
     skipped_probe: tuple[str, ...] = ()
@@ -6844,6 +7631,113 @@ def _self_check_round(draft_dir: Path, draft: dict, *, round_index: int):
     )
 
 
+def _json_shape(value: object, depth: int = 2) -> object:
+    """A bounded description of a JSON value (shared with the live probe)."""
+
+    from repoproof.execution.open_api_replay import json_shape
+
+    return json_shape(value, depth)
+
+
+def _recorded_body_shapes_for_draft(draft_dir: Path) -> dict[str, object]:
+    """Materialise the draft's fixtures with its own builder and describe each recorded body.
+
+    The judge is told which GET keys the recordings hold; it also needs to know
+    what those bodies contain, or it demands fields the recording never had
+    (incident-verifier-not-told-the-recorded-requests-*, second facet).
+    """
+
+    import sys
+    import tempfile
+
+    from repoproof.adoption.intake.workspace_fixtures import FixtureBlueprintV1, build_fixture_candidate
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME, canonical_query
+    from repoproof.runner.open_api_rehearsal import manifest_rows
+
+    draft_dir = Path(draft_dir)
+    builder = draft_dir / "fixture_builder.py"
+    try:
+        document = json.loads((draft_dir / "fixture_blueprints.json").read_text(encoding="utf-8"))
+        rows = document.get("blueprints") if isinstance(document, dict) else None
+        blueprints = [FixtureBlueprintV1.model_validate(item) for item in (rows or [])]
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not builder.is_file() or not blueprints:
+        return {}
+    shapes: dict[str, object] = {}
+    with tempfile.TemporaryDirectory(prefix="repoproof-body-shapes-") as temp:
+        for blueprint in blueprints[:4]:
+            try:
+                candidate = build_fixture_candidate(
+                    blueprint=blueprint,
+                    builder_id="body-shape-probe",
+                    builder_source=builder,
+                    fixture_root=Path(temp) / blueprint.blueprint_id,
+                    python_exe=sys.executable,
+                    isolation_required=False,
+                )
+            except Exception:  # noqa: BLE001 - a builder that cannot run has its own failure path
+                continue
+            responses = Path(candidate.fixture_path) / RESPONSES_DIRNAME
+            if not responses.is_dir():
+                continue
+            for row in manifest_rows(responses):
+                host = str(row.get("host") or "").strip().lower()
+                path = "/" + str(row.get("path") or "").strip().lstrip("/")
+                query = canonical_query(str(row.get("query") or ""))
+                key = f"GET {host}{path}" + (f"?{query}" if query else "")
+                if key in shapes or len(shapes) >= 12:
+                    continue
+                body_path = responses / str(row.get("body") or "")
+                try:
+                    body = json.loads(body_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeError):
+                    shapes[key] = "non-json body"
+                    continue
+                shape = _json_shape(body)
+                if len(json.dumps(shape, ensure_ascii=False)) > 800:
+                    shape = _json_shape(body, depth=1)
+                shapes[key] = shape
+    return shapes
+
+
+def _recorded_manifest_shape() -> dict[str, str]:
+    """The replay manifest document's shape, as a named context fact for the judge.
+
+    A judge once read manifest.get("requests", manifest.get("rows")) for eight
+    rounds; the key is "responses" (incident-verifier-not-told-the-recorded-requests-*).
+    """
+
+    return {
+        "schema_version": "int",
+        "responses": "array of {method: str, host: str, path: str, query: str, status: int, "
+        "content_type: str, body: str (file name inside __responses__)}",
+    }
+
+
+def _recorded_requests_for_draft(draft_dir: Path) -> list[str]:
+    """The GET keys the draft's fixtures record, for the judge's repair context."""
+
+    from repoproof.adoption.intake.tool_drafter import recorded_request_keys
+
+    path = Path(draft_dir) / "fixture_blueprints.json"
+    if path.is_symlink() or not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = document.get("blueprints") if isinstance(document, dict) else None
+    keys = recorded_request_keys(rows if isinstance(rows, list) else [])
+    if keys:
+        return keys
+    # Request rows live in builder code, not blueprint parameters: the keys
+    # the fixture records are then a materialisation fact
+    # (incident-repairs-blind-to-the-disputed-candidate-*).
+    recorded = _fixture_excerpt_for_draft(draft_dir).get("recorded_requests")
+    return [str(item) for item in recorded] if isinstance(recorded, list) else []
+
+
 def _self_check_public_context(draft: dict) -> dict[str, object]:
     intent = draft.get("_intent_contract") or {}
     tool = draft.get("tool") or {}
@@ -6878,6 +7772,24 @@ def _self_check_artifact_observation(
 
     from fnmatch import fnmatch
 
+    # The candidate the failing round disputed comes first: the state file is
+    # written only when every candidate passed, so on failure it described an
+    # older generation or nothing (incident-repairs-blind-to-the-disputed-candidate-*).
+    disputed = _disputed_candidate(Path(draft_dir))
+    if disputed is not None:
+        observation = disputed.get("output_observation")
+        rows = observation.get("files") if isinstance(observation, dict) else None
+        if isinstance(rows, list):
+            files = [
+                row for row in rows
+                if isinstance(row, dict)
+                and not any(fnmatch(str(row.get("path") or ""), pattern) for pattern in excluded)
+            ]
+            return {
+                "blueprint_id": str(disputed.get("blueprint_id") or ""),
+                "files": files,
+                "note": str(observation.get("note") or "") if isinstance(observation, dict) else "",
+            }
     state_path = Path(draft_dir) / _WORKSPACE_FIXTURE_STATE
     files: list[dict[str, object]] = []
     if state_path.is_file() and not state_path.is_symlink():
@@ -6887,21 +7799,7 @@ def _self_check_artifact_observation(
             expected_dir = Path(str((records or [{}])[0].get("expected_dir") or ""))
         except (OSError, ValueError, AttributeError, IndexError):
             expected_dir = Path("")
-        if expected_dir.is_dir():
-            budget = _OBSERVATION_TOTAL_CHARS
-            for path in sorted(expected_dir.rglob("*")):
-                if path.is_symlink() or not path.is_file():
-                    continue
-                relative = path.relative_to(expected_dir).as_posix()
-                if any(fnmatch(relative, pattern) for pattern in excluded):
-                    continue
-                payload = path.read_bytes()
-                row: dict[str, object] = {"path": relative, "bytes": len(payload), "first_line": ""}
-                row.update(_observe_artifact_payload(payload, budget=budget))
-                budget -= len(str(row.get("excerpt") or ""))
-                files.append(row)
-                if len(files) >= 40:
-                    break
+        files = _output_observation(expected_dir, excluded=excluded)
     return {
         "files": files,
         "note": (
@@ -6914,6 +7812,10 @@ def _self_check_artifact_observation(
 _OBSERVATION_EXCERPT_CHARS = 1600
 _OBSERVATION_TOTAL_CHARS = 24000
 _OBSERVATION_ZIP_MEMBERS = 24
+_OBSERVATION_ZIP_HEAD_CHARS = 400
+_OBSERVATION_ZIP_TEXT_SUFFIXES = (
+    ".xhtml", ".html", ".htm", ".xml", ".opf", ".ncx", ".json", ".txt", ".csv", ".md", ".svg", ".css", ".js",
+)
 
 
 def _observe_artifact_payload(payload: bytes, *, budget: int) -> dict[str, object]:
@@ -6933,7 +7835,29 @@ def _observe_artifact_payload(payload: bytes, *, budget: int) -> dict[str, objec
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                 members = [info.filename for info in archive.infolist() if not info.is_dir()]
-            return {"zip_members": members[:_OBSERVATION_ZIP_MEMBERS], "zip_member_count": len(members)}
+                # Member names alone hid a navigation page that listed every
+                # chapter title; the judge that counted it as a chapter could not
+                # be repaired against a list of names
+                # (incident-repairs-blind-to-the-disputed-candidate-*).
+                heads: dict[str, str] = {}
+                remaining = max(0, min(_OBSERVATION_EXCERPT_CHARS * 2, budget))
+                for name in members[:_OBSERVATION_ZIP_MEMBERS]:
+                    if remaining <= 0 or not name.lower().endswith(_OBSERVATION_ZIP_TEXT_SUFFIXES):
+                        continue
+                    try:
+                        text = archive.read(name)[:4096].decode("utf-8")
+                    except (KeyError, UnicodeDecodeError, zipfile.BadZipFile, RuntimeError):
+                        continue
+                    head = text[: min(_OBSERVATION_ZIP_HEAD_CHARS, remaining)]
+                    heads[name] = head
+                    remaining -= len(head)
+            row: dict[str, object] = {
+                "zip_members": members[:_OBSERVATION_ZIP_MEMBERS],
+                "zip_member_count": len(members),
+            }
+            if heads:
+                row["zip_text_heads"] = heads
+            return row
         except zipfile.BadZipFile:
             pass
     try:
@@ -7030,6 +7954,23 @@ def _apply_draft_control_repair(
         # next attempt argues from evidence instead of repeating the refusal.
         "previous_rejections": list(previous_rejections),
     }
+    if reason_code in _INPUT_DISPUTE_CODES and target in _excerpt_targets_for(reason_code):
+        excerpt = _fixture_excerpt_for_draft(Path(draft_dir), blueprint_id=_disputed_blueprint_id(diagnostics))
+        if excerpt:
+            failure_context["rejected_input_excerpt"] = excerpt
+        disputed = _disputed_candidate(Path(draft_dir))
+        if target != "verifier" and disputed is not None and disputed.get("output_observation"):
+            # The judge already receives this as artifact_observation; the other
+            # owners argue about the same produced tree.
+            failure_context["disputed_output_observation"] = disputed["output_observation"]
+    surface = _upstream_surface_for_draft(Path(draft_dir), draft, diagnostics)
+    if surface:
+        failure_context["upstream_module_surface"] = surface
+    boundaries = known_boundaries_for_draft(Path(draft_dir))
+    if boundaries:
+        # Walls earlier rehearsals proved: a builder or producer repair that
+        # re-records one has not repaired anything.
+        failure_context["known_boundaries"] = boundaries
     if target != "verifier" and _confirmed_workspace_examples_present(draft_dir):
         return DraftSelfCheckRepairV1(
             target=target,
@@ -7038,6 +7979,14 @@ def _apply_draft_control_repair(
             reason_code="CONFIRMED_EXAMPLES_PRESENT",
         )
     public_context = _self_check_public_context(draft)
+    recorded_requests = _recorded_requests_for_draft(draft_dir)
+    if recorded_requests:
+        public_context["recorded_requests"] = recorded_requests
+        if target == "verifier":
+            public_context["recorded_manifest_shape"] = _recorded_manifest_shape()
+            shapes = _recorded_body_shapes_for_draft(Path(draft_dir))
+            if shapes:
+                public_context["recorded_body_shapes"] = shapes
     draft_dir = Path(draft_dir)
     snapshot = _snapshot_draft_control_state(draft_dir)
     _begin_draft_control_repair(draft_dir)
@@ -7252,7 +8201,9 @@ def _apply_draft_control_repair(
             f"{row.get('loc', '')}: {row.get('msg', '')}".strip(": ")
             for row in (getattr(exc, "diagnostics", None) or [])
             if isinstance(row, dict)
-        )[:16]
+        )[:16] or tuple(
+            str(row)[:200] for row in (getattr(exc, "diagnostics", None) or []) if str(row)
+        )[:16] or ((f"{type(exc).__name__}: {message}"[:200],) if message else ())
         return DraftSelfCheckRepairV1(
             target=target,
             attempts=min(attempts, 2),
@@ -7337,8 +8288,10 @@ def _self_check_repair_rounds(
     # workspace routinely surfaces more independent defects than a single-file
     # task; four defects each fixed once is progress, not a stall
     # (incident-selfcheck-bound-monotone-progress-*).  The hard cap still bounds
-    # the total.
-    stall_repairs = 0
+    # the total.  The budget is per failure signature: stalls on one failure
+    # must not veto the first attempt at a different one that appears later
+    # (incident-stall-budget-vetoes-a-new-failure-*).
+    stalls: dict[tuple[str, str], int] = {}
     # An *attempt* is an owner plus the evidence it was handed.  Handing the
     # same evidence to a control that has not answered it yet is a different
     # attempt, not a stall: keying this on the evidence alone spent the budget
@@ -7382,7 +8335,12 @@ def _self_check_repair_rounds(
             check.reason_codes[0] if check.reason_codes else "",
             check.diagnostics[0] if check.diagnostics else "",
         )
-        if check.check_ok or not repair or stall_repairs >= bound or repairs_done >= hard_cap:
+        if (
+            check.check_ok
+            or not repair
+            or stalls.get(signature, 0) >= bound
+            or repairs_done >= hard_cap
+        ):
             useless = [
                 f"{INEFFECTIVE_OWNER}: {owner} 改写了 {count} 次,失败的原话逐字未变"
                 for owner, count in sorted(no_effect.items())
@@ -7406,11 +8364,7 @@ def _self_check_repair_rounds(
             rounds.append(check)
             break
         code = check.reason_codes[0] if check.reason_codes else ""
-        same_code_repairs = sum(
-            1
-            for previous in rounds
-            if previous.repair is not None and previous.reason_codes[:1] == (code,)
-        )
+        same_code_repairs = _same_failure_repairs(rounds, check)
         target = repair_target_for(
             code, round_index=same_code_repairs + 1, diagnostics=tuple(check.diagnostics)
         )
@@ -7419,7 +8373,7 @@ def _self_check_repair_rounds(
             break
         attempt = (*signature, target)
         if attempt in seen_attempts:
-            stall_repairs += 1
+            stalls[signature] = stalls.get(signature, 0) + 1
         seen_attempts.add(attempt)
         repair_result = _apply_draft_control_repair(
             draft_dir,
@@ -7479,6 +8433,7 @@ def run_draft_self_check(
         DraftSelfCheckReportV1,
         draft_control_binding,
         is_workspace_draft,
+        output_form_downgrade_proposal,
         write_draft_self_check,
     )
 
@@ -7553,6 +8508,9 @@ def run_draft_self_check(
         action = "自动修复未能应用；保留当前草稿与报告，人工复核后重新自检或创建新任务版本。"
     else:
         action = "自检在界内未通过；保留失败证据，人工复核公开合同后重新自检或创建新任务版本。"
+    proposal = None if ok else output_form_downgrade_proposal(tuple(final.diagnostics))
+    if proposal is not None:
+        action = f"{action} {proposal['text']}"
     report = DraftSelfCheckReportV1(
         ok=ok,
         drafter=str(drafter_name),
@@ -7569,6 +8527,7 @@ def run_draft_self_check(
         "rounds": len(rounds),
         "final_reason_codes": list(report.final_reason_codes),
         "recommended_action": action,
+        "downgrade_proposal": proposal,
         "report_path": str(path),
         "report": report.model_dump(mode="json"),
     }

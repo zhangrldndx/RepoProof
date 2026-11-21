@@ -13,6 +13,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.ui.product_theme import apply_product_theme, hero, section_intro, status_badge
 from repoproof.ui.services import product_jobs
 from repoproof.ui.services.product_mode import (
@@ -91,7 +92,7 @@ st.dataframe(
 name = st.selectbox("查看工具详情", [row["name"] for row in filtered])
 tool = next(row for row in filtered if row["name"] == name)
 status = tool["operational_status"]
-workspace_profile = tool.get("delivery_profile_id") == "workspace_bundle_v1"
+workspace_profile = is_workspace_profile(tool.get("delivery_profile_id"))
 st.markdown(f"### {tool['name']} &nbsp; {status_badge(status)}", unsafe_allow_html=True)
 st.write(tool["summary"] or "尚无摘要。")
 

@@ -40,7 +40,15 @@ ENV_SECRET = "REPOPROOF_HOOK_SECRET"
 # 正常实现不可能需要这个前缀)
 PROBE_MARKER = "REPOPROOF_HOOK"
 
+# Per-symbol cap on individually written call receipts.  Beyond it the hook
+# only counts and writes one call_summary row at exit: a dict-subclass
+# upstream instantiating objects while JSON-encoding them made the per-call
+# repr/hmac/append cost eat the judge's whole budget
+# (incident-receipt-hook-unbounded-per-call-cost-*).
+_RECEIPT_LINE_CAP = 200
+
 _SITECUSTOMIZE = r'''"""repoproof import-hook(harness 注入;验收期专用,交付期不存在)。"""
+import atexit
 import hashlib
 import hmac
 import functools
@@ -49,7 +57,37 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import reprlib
 import sys
+
+_LINE_CAP = __CAP__
+_SHORT = reprlib.Repr()
+_SHORT.maxstring = 48
+_SHORT.maxother = 48
+_SCALARS = (str, bytes, int, float, bool, type(None))
+
+
+def _shape(value, depth=2):
+    """A digest input that never runs user code: scalars bounded, containers by type and length, objects by type.
+
+    reprlib still calls an object's own __repr__, and an upstream whose __repr__
+    walks through its own (hooked) API made every receipt recurse into more
+    receipts (incident-receipt-hook-unbounded-per-call-cost-*).
+    """
+
+    if isinstance(value, _SCALARS):
+        return _SHORT.repr(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if depth <= 0:
+            return "%s[%d]" % (type(value).__name__, len(value))
+        head = ",".join(_shape(item, depth - 1) for item in list(value)[:4])
+        return "%s[%d](%s)" % (type(value).__name__, len(value), head)
+    if isinstance(value, dict):
+        if depth <= 0:
+            return "%s{%d}" % (type(value).__name__, len(value))
+        head = ",".join("%s:%s" % (_shape(k, 0), _shape(v, depth - 1)) for k, v in list(value.items())[:4])
+        return "%s{%d}(%s)" % (type(value).__name__, len(value), head)
+    return "<%s.%s>" % (type(value).__module__, type(value).__qualname__)
 
 
 def _emit(ledger, secret, payload):
@@ -67,8 +105,27 @@ def _install():
         return
     state = {"seq": 0}
     wrapped_class_ids = set()
+    counts = {}
+
+    def _flush_summaries():
+        for sym, n in list(counts.items()):
+            if n > _LINE_CAP:
+                state["seq"] += 1
+                try:
+                    _emit(ledger, secret, {"kind": "call_summary", "module": module, "symbol": sym,
+                                           "seq": state["seq"], "pid": os.getpid(), "extra": n - _LINE_CAP})
+                except Exception:
+                    pass
+
+    atexit.register(_flush_summaries)
 
     def _record(kind, symbol, extra=None):
+        if state.get("busy"):
+            return  # a call made while the hook itself was recording: not the tool's
+        if kind == "call":
+            counts[symbol] = counts.get(symbol, 0) + 1
+            if counts[symbol] > _LINE_CAP:
+                return  # counted; summarised at exit
         state["seq"] += 1
         payload = {"kind": kind, "module": module, "symbol": symbol,
                    "seq": state["seq"], "pid": os.getpid()}
@@ -85,7 +142,7 @@ def _install():
         # registry/functor 惯用法把未构造完的 self 传给公开类)。摘要
         # 允许降级为类型名投影,异常一律不得离开量具。
         try:
-            rendered = repr((a, sorted(kw.items())))
+            rendered = _shape((a, sorted(kw.items())))
         except Exception:
             try:
                 rendered = "types:" + ",".join(
@@ -96,6 +153,13 @@ def _install():
         return hashlib.sha256(
             rendered[:2000].encode("utf-8", "replace")
         ).hexdigest()[:16]
+
+    def _guarded_digest(a, kw):
+        state["busy"] = True
+        try:
+            return _args_digest(a, kw)
+        finally:
+            state["busy"] = False
 
     def _wrap_callables(mod, modname):
         for name in list(vars(mod)):
@@ -120,11 +184,18 @@ def _install():
                     continue
                 if id(obj) in wrapped_class_ids:
                     continue
-                original_new = getattr(obj, "__new__", object.__new__)
+                # 只有类**自己**定义的 __new__ 才能被闭包记住;继承来的要在
+                # 调用时按**实际类**的 MRO 去找 —— 否则一个 list 子类会从被包
+                # 父类那里继承到 object.__new__,构造即炸
+                # (incident-receipt-hook-breaks-builtin-subclass-*)。
+                own_new = vars(obj).get("__new__")
+                if isinstance(own_new, staticmethod):
+                    own_new = own_new.__func__
 
-                def _make_new(sym, fn):
+                def _make_new(sym, wrapped, own):
                     def _new(cls, *a, **kw):
-                        _record("call", sym, {"args_sha": _args_digest(a, kw)})
+                        _record("call", sym, {"args_sha": _guarded_digest(a, kw)})
+                        fn = own if own is not None else super(wrapped, cls).__new__
                         if fn is object.__new__:
                             return fn(cls)
                         return fn(cls, *a, **kw)
@@ -133,7 +204,7 @@ def _install():
 
                 try:
                     setattr(obj, "__new__", _make_new(
-                        f"{modname}.{name}", original_new))
+                        f"{modname}.{name}", obj, own_new))
                 except (AttributeError, TypeError):
                     continue
                 wrapped_class_ids.add(id(obj))
@@ -142,7 +213,7 @@ def _install():
             def _make(sym, fn):
                 @functools.wraps(fn)
                 def _proxy(*a, **kw):
-                    _record("call", sym, {"args_sha": _args_digest(a, kw)})
+                    _record("call", sym, {"args_sha": _guarded_digest(a, kw)})
                     return fn(*a, **kw)
                 # functools.wraps 只拷 __dict__;lru_cache/singledispatch 等包装器
                 # 的 cache_clear/cache_info/register 是对象上的方法,上游自己会调
@@ -207,7 +278,9 @@ def write_hook_dir(dest: Path) -> Path:
     """落 hook 目录(只含 sitecustomize.py);env 三键由调用方注入。"""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    (dest / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
+    (dest / "sitecustomize.py").write_text(
+        _SITECUSTOMIZE.replace("__CAP__", str(_RECEIPT_LINE_CAP)), encoding="utf-8"
+    )
     return dest
 
 
@@ -251,6 +324,9 @@ def verify_import_receipts(
             imports += 1
         elif p.get("kind") == "call":
             calls += 1
+        elif p.get("kind") == "call_summary":
+            # Calls the hook counted past its per-symbol line cap.
+            calls += max(0, int(p.get("extra") or 0))
     if imports < 1:
         return {"ok": False, "imports": imports, "calls": calls,
                 "reason": f"目标模块 {module} 从未被 import(运行时证据缺席)"}

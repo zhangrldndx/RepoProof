@@ -1174,7 +1174,7 @@ def _record_audit_decision(
             if key in semantic:
                 result[f"semantic_verifier_{key}"] = semantic[key]
     if evidence.get("artifact_kind") == "directory":
-        result["delivery_profile_id"] = "workspace_bundle_v1"
+        result["delivery_profile_id"] = str(evidence.get("delivery_profile_id") or "workspace_bundle_v1")
         result["artifact_kind"] = "directory"
         structure = evidence.get("workspace_structure")
         if isinstance(structure, dict) and type(structure.get("ok")) is bool:
@@ -1498,38 +1498,71 @@ def _audit_workspace_execution(
             failure=_SEMANTIC_IDENTITY_FAILURE,
         )
 
+    from repoproof.execution.open_api_replay import replay_session
+
+    open_api_hosts = tuple(workspace_contract.open_api_hosts)
     with tempfile.TemporaryDirectory(prefix="rp-fresh-workspace-") as temp:
         artifact_dir = Path(temp) / "artifact"
-        try:
-            result = subprocess.run(
-                [
-                    str(executable),
-                    str(input_path.resolve()),
-                    "--out-dir",
-                    str(artifact_dir),
-                ],
-                cwd=tool_dir,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            evidence["execution"] = {"status": type(exc).__name__}
+        session_codes: list[str] = []
+        session_facts: dict[str, Any] = {}
+        # An open-API tool runs the sealed way here too: recordings hidden,
+        # declared hosts mapped to the replay stub, a canary in the
+        # environment, and the stub's ledger judged afterwards.  An offline
+        # input passes through this session untouched.
+        with replay_session(input_path, hosts=open_api_hosts, stage_dir=Path(temp) / "session") as session:
+            try:
+                result = subprocess.run(
+                    [
+                        str(executable),
+                        str(session.tool_input.resolve()),
+                        "--out-dir",
+                        str(artifact_dir),
+                    ],
+                    cwd=tool_dir,
+                    capture_output=True,
+                    timeout=timeout,
+                    env={**os.environ, **session.env},
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                evidence["execution"] = {"status": type(exc).__name__}
+                return _record_audit_decision(
+                    dest_root,
+                    name=name,
+                    task_id=task_id,
+                    run_id=run_id,
+                    decision=REVOKED,
+                    reason_code="FRESH_INPUT_EXECUTION_FAILED",
+                    reason="The workspace tool did not complete the fresh-input audit.",
+                    evidence=evidence,
+                    failure=_ADAPTER_EXECUTION_FAILURE,
+                )
+            if session.server is not None:
+                session_codes = session.verdict(artifact_dir if artifact_dir.is_dir() else None)
+                session_facts = {
+                    "hosts": list(open_api_hosts),
+                    "requests": len(session.server.ledger),
+                    "reason_codes": list(session_codes),
+                    "unrecorded": session.details(),
+                }
+        evidence["execution"] = {
+            "returncode": result.returncode,
+            "stdout_sha256": _sha256(result.stdout),
+            "stderr_sha256": _sha256(result.stderr),
+        }
+        if session_facts:
+            evidence["open_api_session"] = session_facts
+        if session_codes:
             return _record_audit_decision(
                 dest_root,
                 name=name,
                 task_id=task_id,
                 run_id=run_id,
                 decision=REVOKED,
-                reason_code="FRESH_INPUT_EXECUTION_FAILED",
-                reason="The workspace tool did not complete the fresh-input audit.",
+                reason_code=session_codes[0],
+                reason="The workspace tool stepped outside its sealed open-API session during the audit.",
                 evidence=evidence,
                 failure=_ADAPTER_EXECUTION_FAILURE,
             )
-        evidence["execution"] = {
-            "returncode": result.returncode,
-            "stdout_sha256": _sha256(result.stdout),
-            "stderr_sha256": _sha256(result.stderr),
-        }
         if result.returncode != 0 or not artifact_dir.is_dir():
             return _record_audit_decision(
                 dest_root,

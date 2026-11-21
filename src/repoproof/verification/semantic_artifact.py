@@ -224,10 +224,19 @@ class SemanticCandidateScreenV1(BaseModel):
         return self
 
 
-_RUNNER = r'''import importlib.util
+_RUNNER = r'''import faulthandler
+import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
+
+# When the Harness budget is about to expire, dump every thread's Python
+# stack to stderr and exit: a hung verifier then says where it hung instead
+# of vanishing into TimeoutExpired (incident-verifier-timeout-without-location-*).
+_budget = float(os.environ.get("REPOPROOF_VERIFIER_BUDGET_S") or 0)
+if _budget > 0:
+    faulthandler.dump_traceback_later(max(_budget - 5.0, _budget * 0.6, 0.5), exit=True, file=sys.stderr)
 
 source, input_path, artifact_path, control = sys.argv[1:5]
 try:
@@ -562,6 +571,24 @@ def semantic_verifier_evidence_sha256(
     return hashlib.sha256(payload).hexdigest()
 
 
+def _stderr_text(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _timeout_error(timeout_s: int, control: str, stderr: str) -> SemanticVerifierError:
+    """A timeout that names its budget, its control and the frames the child was in."""
+
+    lines = [" ".join(line.split()) for line in stderr.splitlines() if line.strip()]
+    frames = [line for line in lines if line.startswith("File ") or line.startswith("Timeout (")]
+    error = SemanticVerifierError(
+        f"semantic verifier execution failed: TimeoutExpired after {int(timeout_s)}s in control {control}"
+    )
+    error.diagnostics = tuple((frames or lines)[-8:])  # type: ignore[attr-defined]
+    return error
+
+
 def _execute_snapshot(
     *,
     stage_root: Path,
@@ -597,6 +624,7 @@ def _execute_snapshot(
         ENV_MODULE: import_module,
         ENV_LEDGER: str(ledger),
         ENV_SECRET: secret,
+        "REPOPROOF_VERIFIER_BUDGET_S": str(int(timeout_s)),
     })
     argv = [
         python_exe,
@@ -623,10 +651,15 @@ def _execute_snapshot(
             env=env,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise _timeout_error(timeout_s, control, _stderr_text(exc.stderr)) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise SemanticVerifierError(
             f"semantic verifier execution failed: {type(exc).__name__}"
         ) from exc
+    if process.returncode != 0 and "Timeout (" in (process.stderr or ""):
+        # The runner dumped its own stack and left before the parent's deadline.
+        raise _timeout_error(timeout_s, control, process.stderr or "")
 
     raw = process.stdout or ""
     protocol_ok = len(raw.encode("utf-8", errors="replace")) <= _OUTPUT_CAP

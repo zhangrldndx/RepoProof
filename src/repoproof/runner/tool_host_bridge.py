@@ -31,7 +31,7 @@ from pathlib import Path
 import yaml
 
 from repoproof.adoption.intake.upstream_conformance import precheck_upstream_conformance
-from repoproof.domain.models import TaskContract
+from repoproof.domain.models import TaskContract, is_workspace_profile
 
 _ANCHOR_RULE = ("skeleton anchor files (src/*/main.py, bin/, build.sh, tool.json, "
                 "pyproject.toml) are FROZEN — modifying them is a policy violation")
@@ -99,7 +99,7 @@ def synthesize_host_contract(
         "kind": "host_integrated",          # HostContract.load 硬校验值
         "prompt_profile": (
             "workspace-tool-v1"
-            if tc.tool.delivery_profile_id == "workspace_bundle_v1"
+            if is_workspace_profile(tc.tool.delivery_profile_id)
             else "local-tool-v1"
         ),
         "task_family": "LOCAL-TOOL",
@@ -182,6 +182,50 @@ def _unified_patch(rel: str, old: str, new: str) -> str:
     return "".join(lines)
 
 
+_REFERENCE_MODULE = "impl_reference"
+
+_STAGING_ADAPTER = '''"""Harness-only positive control: a protocol bridge over the verbatim frozen reference.
+
+The reference implementation lives untouched in impl_reference.py.  A producer
+that derives a delivered file from its own source through __file__ therefore
+sees exactly the bytes the sealed self-check saw
+(incident-positive-control-mutates-reference-*).
+"""
+from pathlib import Path
+
+from . import impl_reference as _reference
+
+UserInputError = _reference.UserInputError
+
+
+def build_workspace(input_path, output_dir) -> None:
+    output_dir = Path(output_dir)
+    if not output_dir.is_dir() or any(output_dir.iterdir()):
+        raise RuntimeError("REPOPROOF_WORKSPACE_STAGING_NOT_EMPTY")
+    reference_output = output_dir / ".repoproof-reference-output"
+    _reference.build_workspace(Path(input_path), reference_output)
+    if not reference_output.is_dir():
+        raise RuntimeError("REPOPROOF_REFERENCE_OUTPUT_MISSING")
+    for child in sorted(reference_output.iterdir(), key=lambda item: item.name):
+        child.replace(output_dir / child.name)
+    reference_output.rmdir()
+'''
+
+
+def _workspace_reference_control_files(reference_source: str) -> dict[str, str]:
+    """The positive control as two files: the adapter, and the reference byte for byte."""
+
+    return {"impl.py": _STAGING_ADAPTER, f"{_REFERENCE_MODULE}.py": reference_source}
+
+
+def _new_file_patch(rel: str, new: str) -> str:
+    """git-apply 兼容的新建文件 diff。"""
+    lines = difflib.unified_diff(
+        [], new.splitlines(keepends=True), fromfile="/dev/null", tofile=f"b/{rel}"
+    )
+    return "".join(lines)
+
+
 def _workspace_reference_as_staging_adapter(reference_source: str) -> str:
     """Adapt a final-directory reference to the workspace adapter protocol.
 
@@ -245,14 +289,23 @@ def _write_host_control_groups(
         dst = destination / host_name
         dst.mkdir()
         control_source = (ctrl / "impl.py").read_text(encoding="utf-8")
+        extra_files: dict[str, str] = {}
         if (
             host_name == "positive"
             and tc.tool is not None
-            and tc.tool.delivery_profile_id == "workspace_bundle_v1"
+            and is_workspace_profile(tc.tool.delivery_profile_id)
         ):
-            control_source = _workspace_reference_as_staging_adapter(control_source)
+            # Never rewrite the reference: the bridge is its own module and the
+            # reference travels verbatim beside it
+            # (incident-positive-control-mutates-reference-*).
+            files = _workspace_reference_control_files(control_source)
+            control_source = files["impl.py"]
+            extra_files = {name: body for name, body in files.items() if name != "impl.py"}
         (dst / "impl.py").write_text(control_source, encoding="utf-8")
         patch = _unified_patch(skel_impl_rel, skel_impl, control_source)
+        for name, body in sorted(extra_files.items()):
+            (dst / name).write_text(body, encoding="utf-8")
+            patch += _new_file_patch(f"src/{tc.target_project.package}/{name}", body)
         ctrl_lock = ctrl / "requirements.lock.txt"
         if ctrl_lock.is_file():
             patch += _unified_patch(

@@ -29,7 +29,7 @@ class _Probe:
 def _install(monkeypatch, fresh_result):
     calls: list[tuple[int, bool]] = []
 
-    def fake_candidates(draft_dir, *, n, offline):
+    def fake_candidates(draft_dir, *, n, offline, **_kw):
         calls.append((n, offline))
         if offline:
             return {"ok": True, "candidates": [{"a": 1}, {"b": 2}, {"c": 3}], "generation_id": "generation-base"}

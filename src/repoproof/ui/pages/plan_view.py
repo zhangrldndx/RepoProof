@@ -78,7 +78,11 @@ def _pipeline(goal_text: str, host_p: str, repo_p: str):
 host, repo, adm, plan, intent = _pipeline(goal, host_path, repo_path)
 
 if plan is None:
-    _icon = {"NEED_INFORMATION": "🟡 还需要补充一些信息", "UNSUPPORTED": "❌ 当前版本暂不支持"}
+    _icon = {
+        "NEED_INFORMATION": "🟡 还需要补充一些信息",
+        "UNSUPPORTED": "❌ 当前版本暂不支持",
+        "NEED_REFRAME": "↪️ 碰到支持面边界，下面是系统建议的改写",
+    }
     st.subheader(_icon.get(adm.status, adm.status))
     for f in adm.confirmed_facts:
         st.markdown(f"- ✅ {f}")

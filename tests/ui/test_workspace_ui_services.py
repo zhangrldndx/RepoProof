@@ -372,7 +372,9 @@ def test_workspace_candidate_generation_rejects_reference_verifier_disagreement(
     assert result["reason_codes"] == [
         "WORKSPACE_REFERENCE_VERIFIER_SEMANTIC_DISAGREEMENT"
     ]
-    assert result["diagnostics"] == ["PUBLIC_SEMANTIC_MISMATCH"]
+    # The failing round names the candidate it disputed
+    # (incident-repairs-blind-to-the-disputed-candidate-*).
+    assert result["diagnostics"] == ["PUBLIC_SEMANTIC_MISMATCH", "DISPUTED_BLUEPRINT: ordinary-study"]
     assert (
         seen_semantic_call["intent_confirmation_sha256"]
         == draft_semantics_sha256

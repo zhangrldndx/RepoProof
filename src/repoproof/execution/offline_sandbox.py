@@ -54,8 +54,18 @@ def sanitised_subprocess_env(
     return environment
 
 
-def offline_sandbox_argv(argv: list[str], writable_root: Path) -> list[str]:
-    """Wrap ``argv`` in the reviewed offline/write-contained host sandbox."""
+def offline_sandbox_argv(
+    argv: list[str], writable_root: Path, *, loopback_port: int | None = None
+) -> list[str]:
+    """Wrap ``argv`` in the reviewed offline/write-contained host sandbox.
+
+    ``loopback_port`` opens exactly one outbound path: the local replay server
+    that stands in for an open-API workspace's public hosts.  Everything else
+    stays denied — other local ports, every remote address, and name
+    resolution itself (measured 2026-09-05: the replay port answers, the next
+    port refuses, a public host cannot even be resolved).  Without the argument
+    the profile is byte-for-byte what every offline path has always run under.
+    """
 
     sandbox = Path("/usr/bin/sandbox-exec")
     if sys.platform != "darwin" or not sandbox.is_file():
@@ -64,10 +74,17 @@ def offline_sandbox_argv(argv: list[str], writable_root: Path) -> list[str]:
         )
     real_root = Path(writable_root).resolve()
     escaped_root = str(real_root).replace("\\", "\\\\").replace('"', '\\"')
+    loopback = ""
+    if loopback_port is not None:
+        port = int(loopback_port)
+        if not 1 <= port <= 65535:
+            raise ValueError("loopback_port must be a TCP port number")
+        loopback = f'(allow network-outbound (remote ip "localhost:{port}"))'
     profile = (
         "(version 1)"
         "(allow default)"
         "(deny network*)"
+        f"{loopback}"
         "(deny file-write*)"
         f'(allow file-write* (subpath "{escaped_root}") '
         '(literal "/dev/null"))'

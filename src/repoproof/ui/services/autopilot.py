@@ -24,11 +24,12 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.execution.core_execution import atomic_write_json
 from repoproof.ui.services.product_mode import ui_state_root
 
@@ -53,6 +54,80 @@ STAGES: tuple[Stage, ...] = (
     "final",
 )
 Runner = Callable[[Sequence[str]], dict]
+
+
+class RehearsalOutcome(NamedTuple):
+    ok: bool
+    status: str
+    codes: tuple[str, ...]
+    detail: str
+
+
+def rehearsal_outcome(payload: dict) -> RehearsalOutcome:
+    """Read the rehearsal verdict, including the live probe's boundary (m6.4 prework 8).
+
+    A boundary found against today's real host is its own terminal state: the
+    codes are the probe's, the detail is the downgrade proposal verbatim, so the
+    journey report tells the user what changed and what they can choose.
+    """
+
+    verdict = str(payload.get("verdict") or "")
+    stages_raw = payload.get("stages")
+    stages: dict = stages_raw if isinstance(stages_raw, dict) else {}
+    probe_raw = stages.get("live_probe")
+    probe: dict = probe_raw if isinstance(probe_raw, dict) else {}
+    if verdict == "REHEARSAL_LIVE_BOUNDARY" or probe.get("status") == "LIVE_BOUNDARY":
+        proposal_raw = probe.get("downgrade_proposal")
+        proposal: dict = proposal_raw if isinstance(proposal_raw, dict) else {}
+        codes = tuple(str(code) for code in (probe.get("reason_codes") or ())) or ("REHEARSAL_LIVE_BOUNDARY",)
+        return RehearsalOutcome(False, "REHEARSAL_BOUNDARY", codes, str(proposal.get("text") or ""))
+    if verdict == "REHEARSAL_LIVE_PROBE_ERROR":
+        return RehearsalOutcome(
+            False, "REHEARSAL_LIVE_PROBE_ERROR", ("LIVE_PROBE_ERROR",), str(probe.get("error") or "")
+        )
+    if verdict == "REHEARSAL_PASS_ONLY":
+        return RehearsalOutcome(True, "REHEARSAL_PASS_ONLY", (), "")
+    return RehearsalOutcome(False, "REHEARSAL_FAILED", (), "")
+
+
+def _diagnostics_summary(rows) -> str | None:
+    """``loc: msg`` per public diagnostic row, joined and bounded; None when there are none."""
+
+    parts: list[str] = []
+    for row in rows or ():
+        if isinstance(row, dict):
+            loc = str(row.get("loc") or "").strip()
+            msg = str(row.get("msg") or row.get("type") or "").strip()
+            parts.append(f"{loc}: {msg}" if loc else msg)
+        elif str(row).strip():
+            parts.append(str(row).strip())
+    text = "; ".join(part for part in parts if part)
+    return text[:600] or None
+
+
+_BOUNDARY_ROW_CODES = frozenset(
+    {"PLATFORM_REQUIRES_CREDENTIALS", "ENDPOINT_GONE", "METHOD_NOT_ALLOWED", "RESPONSE_SHAPE_DRIFTED"}
+)
+
+
+def boundary_rows(live_probe: dict) -> list[dict]:
+    """The probe's decisive rows, as facts a redraft can route around."""
+
+    rows: list[dict] = []
+    for row in (live_probe.get("requests") or ()) if isinstance(live_probe, dict) else ():
+        if not isinstance(row, dict) or str(row.get("code") or "") not in _BOUNDARY_ROW_CODES:
+            continue
+        fact = {
+            "host": str(row.get("host") or ""),
+            "path": str(row.get("path") or ""),
+            "query": str(row.get("query") or ""),
+            "code": str(row.get("code") or ""),
+            "detail": str(row.get("detail") or "")[:240],
+        }
+        if row.get("live_shape") is not None:
+            fact["live_shape"] = row["live_shape"]
+        rows.append(fact)
+    return rows
 
 
 class AutopilotStageV1(BaseModel):
@@ -263,6 +338,8 @@ def run_journey_autopilot(
     revision: str | None = None,
     until: Stage = "final",
     expect_admission_rejection: bool = False,
+    accept_boundary_proposal: bool = False,
+    known_boundaries: list[dict] | None = None,
     batch: str = "EXPLORATORY_UNPREREGISTERED",
     agent_backend: str = "mini-swe",
     runner: Runner | None = None,
@@ -279,9 +356,17 @@ def run_journey_autopilot(
     run = runner or cli_runner(project_root)
 
     def run_stage(stage: str, argv: list[str]) -> dict:
-        """Run one CLI stage and persist its raw payload so failures are diagnosable from disk."""
+        """Run one CLI stage and persist its raw payload so failures are diagnosable from disk.
+
+        A redraft after an accepted boundary keeps its own payload files
+        (``<stage>-redraft<N>.json``): the first pass stays on disk untouched.
+        """
 
         payload = run(argv)
+        persist_stage(stage if boundary_round == 0 else f"{stage}-redraft{boundary_round}", payload)
+        return payload
+
+    def persist_stage(stage: str, payload) -> None:
         roots = [Path(record_dir) / "stages"] if record_dir is not None else []
         try:
             roots.append(ui_state_root() / "autopilot" / journey.journey_id / "stages")
@@ -296,7 +381,8 @@ def run_journey_autopilot(
                 )
             except OSError:
                 continue
-        return payload
+
+    provenance_extra: dict = {}
     created_at = _now()
     stages: list[AutopilotStageV1] = []
     facts: dict[str, str | None] = {
@@ -355,6 +441,7 @@ def run_journey_autopilot(
                 "examples_confirmed_by": "autopilot",
                 "intent_confirmed_by": "autopilot",
                 "human_material": "repository URL + one-sentence capability request only",
+                **provenance_extra,
             },
             created_at=created_at,
             completed_at=_now(),
@@ -372,25 +459,77 @@ def run_journey_autopilot(
         return STAGES.index(stage) >= STAGES.index(until)
 
     resume = resume_task_id is not None
-    if not resume:
+    # A rehearsal boundary the autopilot accepts (once) sends the journey back
+    # to drafting with the boundary rows as known facts; the while/else runs
+    # its else only when there is nothing to draft (a resumed task).
+    known_boundaries = [dict(row) for row in (known_boundaries or []) if isinstance(row, dict)]
+    boundary_round = 0
+    # The capability the journey is currently drafting: the user's words, or
+    # the reframe admission offered and the autopilot accepted.  A redraft
+    # after a boundary starts from that accepted text and carries the
+    # boundary rows — the reframe branch once dropped them
+    # (incident-boundary-redraft-lost-on-reframe-*).
+    active_capability = capability
+
+    def add_argv(text: str) -> list[str]:
+        return [
+            "tool",
+            "add",
+            *(["--known-boundaries-json", json.dumps(known_boundaries, ensure_ascii=False)]
+              if known_boundaries else []),
+            "--repo",
+            repo,
+            "--capability",
+            text,
+            "--draft-out",
+            str(draft_dir),
+            *(["--revision", revision] if revision else []),
+        ]
+
+    while not resume:
         # ---- draft (admission + drafting + self-check/self-repair) ----
         started = time.monotonic()
-        payload = run_stage(
-            "draft",
-            [
-                "tool",
-                "add",
-                "--repo",
-                repo,
-                "--capability",
-                capability,
-                "--draft-out",
-                str(draft_dir),
-                *(["--revision", revision] if revision else []),
-            ]
-        )
+        payload = run_stage("draft", add_argv(active_capability))
         admission = payload.get("admission") or {}
         status = str(admission.get("status") or "")
+        if status == "NEED_REFRAME":
+            # The boundary was named and a supported rewrite offered.  The
+            # autopilot stands in for the user and accepts it — once.  A second
+            # reframe means admission contradicts itself; an expected rejection
+            # that got a reframe instead means the boundary was misclassified.
+            codes = tuple(str(c) for c in (admission.get("reason_codes") or [])) or ("NEED_REFRAME",)
+            reframed = str(admission.get("reframed_capability") or "")
+            record(
+                "draft",
+                True,
+                codes=codes,
+                detail="; ".join(str(q) for q in (admission.get("questions") or [])),
+                started=started,
+                extra={"admission_status": status, "reframed_capability": reframed or None},
+            )
+            if expect_admission_rejection:
+                return finish(ok=False, status="REFRAME_WHERE_REJECTION_EXPECTED", stop="draft", codes=codes)
+            if not reframed or reframed == capability:
+                return finish(ok=False, status="REFRAME_LOOP", stop="draft", codes=codes)
+            persist_stage("draft-boundary", payload)
+            # provenance is a flat string map (the record schema is frozen);
+            # the reframe travels as four plain facts.
+            provenance_extra.update(
+                {
+                    "reframe_original": capability,
+                    "reframe_accepted": reframed,
+                    "reframe_accepted_by": "autopilot",
+                    "reframe_reason_codes": ",".join(codes),
+                }
+            )
+            started = time.monotonic()
+            active_capability = reframed
+            payload = run_stage("draft", add_argv(active_capability))
+            admission = payload.get("admission") or {}
+            status = str(admission.get("status") or "")
+            if status == "NEED_REFRAME":
+                again = tuple(str(c) for c in (admission.get("reason_codes") or [])) or codes
+                return finish(ok=False, status="REFRAME_LOOP", stop="draft", codes=again)
         if status == "UNSUPPORTED":
             codes = tuple(str(c) for c in (admission.get("reason_codes") or [])) or ("ADMISSION_UNSUPPORTED",)
             record(
@@ -417,7 +556,15 @@ def run_journey_autopilot(
                 started=started,
                 extra={
                     "admission_status": status,
-                    "validation_errors": list(payload.get("draft_error_diagnostics") or []),
+                    "validation_errors": list(
+                        payload.get("draft_error_diagnostics") or payload.get("diagnostics") or []
+                    ),
+                    # The report's facts keep scalars only; the field rows are
+                    # summarised into one bounded line so the report itself
+                    # says which rule refused what.
+                    "validation_errors_summary": _diagnostics_summary(
+                        payload.get("draft_error_diagnostics") or payload.get("diagnostics") or []
+                    ),
                 },
             )
             return finish(ok=False, status="DRAFT_FAILED", stop="draft", codes=codes)
@@ -454,6 +601,38 @@ def run_journey_autopilot(
             },
         )
         if not selfcheck_ok:
+            proposal_raw = selfcheck.get("downgrade_proposal")
+            proposal = proposal_raw if isinstance(proposal_raw, dict) else {}
+            if (
+                accept_boundary_proposal
+                and boundary_round == 0
+                and str(proposal.get("kind") or "") == "OUTPUT_FORM"
+            ):
+                # The self-check found the delivery form itself infeasible offline
+                # (a library the upstream does not ship, a page that fetches);
+                # the autopilot stands in for the user and takes the static
+                # form — once (incident-fabricated-frontend-asset-*).
+                proposal_codes = tuple(str(c) for c in (proposal.get("codes") or ())) or ("OUTPUT_FORM",)
+                references = [str(r) for r in (proposal.get("references") or ())] or [""]
+                boundary_round += 1
+                known_boundaries = [
+                    {
+                        "host": "",
+                        "path": reference,
+                        "query": "",
+                        "code": proposal_codes[0],
+                        "detail": str(proposal.get("text") or "")[:240],
+                    }
+                    for reference in references[:4]
+                ]
+                provenance_extra.update(
+                    {
+                        "boundary_proposal_accepted_by": "autopilot",
+                        "boundary_original_task": "",
+                        "boundary_codes": ",".join(proposal_codes),
+                    }
+                )
+                continue
             # A pinned upstream that cannot stand in for its release is a supply
             # fact, not a failed draft: give it its own terminal state so nobody
             # reads it as "the model could not write this tool".
@@ -464,7 +643,7 @@ def run_journey_autopilot(
                 stop="draft",
                 codes=codes or ("DRAFT_SELF_CHECK_FAILED",),
             )
-        if profile != "workspace_bundle_v1":
+        if not is_workspace_profile(profile):
             record(
                 "confirm_examples",
                 False,
@@ -583,15 +762,21 @@ def run_journey_autopilot(
         facts["task_id"] = task_id
         if task_id:
             update_journey(journey.journey_id, task_id=task_id)
-        ok = payload.get("verdict") == "REHEARSAL_PASS_ONLY"
+        rehearsed = rehearsal_outcome(payload)
+        ok = rehearsed.ok
         rehearsal = (payload.get("stages") or {}).get("rehearsal") or {}
+        live = (payload.get("stages") or {}).get("live_probe") or {}
         failed_stage, sub_codes, sub_detail, sub_owner = _failed_substage(payload)
-        codes = () if ok else (sub_codes or _codes(rehearsal, *(_codes(payload, "REHEARSAL_FAILED"))))
+        codes = () if ok else (
+            rehearsed.codes or sub_codes or _codes(rehearsal, *(_codes(payload, "REHEARSAL_FAILED")))
+        )
         record(
             "rehearsal",
             ok,
             codes=codes,
-            detail=sub_detail or str(rehearsal.get("recommended_action") or payload.get("error") or ""),
+            detail=rehearsed.detail
+            or sub_detail
+            or str(rehearsal.get("recommended_action") or payload.get("error") or ""),
             started=started,
             extra={
                 "verdict": str(payload.get("verdict") or ""),
@@ -600,12 +785,38 @@ def run_journey_autopilot(
                     str(rehearsal.get("failure_owner") or sub_owner or payload.get("failure_owner") or "") or None
                 ),
                 "failed_stage": failed_stage,
+                "live_probe": str(live.get("status") or "") or None,
             },
         )
         if not ok:
-            return finish(ok=False, status="REHEARSAL_FAILED", stop="rehearsal", codes=codes)
+            rows = boundary_rows(live) if rehearsed.status == "REHEARSAL_BOUNDARY" else []
+            proposal_kind = str((live.get("downgrade_proposal") or {}).get("kind") or "")
+            # A RECORDING proposal (endpoint, method or shape) keeps every
+            # deliverable: taking it is not a downgrade, so any journey may
+            # take it once.  A PLATFORM_ACCESS proposal (credentials) is the
+            # user's call and needs the explicit flag
+            # (incident-405-misread-as-availability-*).
+            acceptable = proposal_kind == "RECORDING" or (
+                proposal_kind == "PLATFORM_ACCESS" and accept_boundary_proposal
+            )
+            if acceptable and boundary_round == 0 and rows:
+                # The autopilot stands in for the user and takes proposal ②
+                # (redraft around the boundary) — once.  A second boundary is
+                # the user's decision again (incident-boundary-proposal-has-no-retry-path-*).
+                boundary_round += 1
+                known_boundaries = rows
+                provenance_extra.update(
+                    {
+                        "boundary_proposal_accepted_by": "autopilot",
+                        "boundary_original_task": str(task_id or ""),
+                        "boundary_codes": ",".join(codes),
+                    }
+                )
+                continue
+            return finish(ok=False, status=rehearsed.status, stop="rehearsal", codes=codes)
         if stop_after("rehearsal"):
             return finish(ok=True, status="PAUSED_AT_REHEARSAL", stop=None, codes=())
+        break
     else:
         task_id = resume_task_id
         update_journey(journey.journey_id, task_id=task_id)

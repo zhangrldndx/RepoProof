@@ -46,7 +46,10 @@ def test_rows_name_the_member_and_the_line(tmp_path: Path) -> None:
     )
     by_path = {row["path"]: row for row in rows}
     assert by_path["book.xlsx"]["kind"] == "BYTES_DIFFER"
-    assert by_path["book.xlsx"]["locus"] == "docProps/core.xml"
+    # The member and, since it is text, its differing line — actual side only
+    # (incident-drift-locus-stops-at-the-zip-member-*).
+    assert by_path["book.xlsx"]["locus"].startswith("docProps/core.xml: line 1: ")
+    assert "11:00:01Z" in by_path["book.xlsx"]["locus"] and "10:59:58Z" not in by_path["book.xlsx"]["locus"]
     svg = by_path["charts/spend.svg"]
     assert svg["kind"] == "BYTES_DIFFER" and svg["locus"].startswith("line 3")
     assert "chart-9b1c" in svg["locus"] and "chart-3f2a" not in svg["locus"]  # actual side only

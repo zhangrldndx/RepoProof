@@ -1,8 +1,8 @@
 # RepoProof 下一阶段开发指导：Verified Tool Onboarding Harness
 
 > 日期：2026-08-25  
-> 盘面基线：`main @ 812bb7b`；当前开发分支
-> `codex/m7-managed-sidecar-tools @ 7ac1a09`  
+> 功能事实基线：`main @ 812bb7b`；M7 代码基线
+> `codex/m7-managed-sidecar-tools @ 7ac1a09`；其后仅增加本指导文档提交
 > 文档目的：吸收“DeepSeek Harness 分析报告”最近一次同类产品调研，结合
 > RepoProof 当前代码和证据边界，给出一条适合单人、短周期、稳定优先的后续路线。
 
@@ -16,11 +16,12 @@ RepoProof 的新定位合理，但还应再精确一层：
 > 独立验证、clean replay 和运营发布账决定结果，而不是由 Agent 自述决定。**
 
 这一定义比“GitHub → MCP 生成器”更有差异化，也比“通用 Coding Agent”更可控。
-它把 RepoProof 的价值放在三件已经有代码基础的事情上：
+它把 RepoProof 的价值放在四件已经有代码基础的事情上：
 
 1. 判断一个能力是否适合被工具化，以及应该走哪条实现路线；
 2. 为 Agent 提供受约束的合同、环境和公开反馈，而不是盲目让 Agent 自由开发；
-3. 在 Agent 之外证明工具是否满足合同、是否真实采用上游、是否可重放、现在是否
+3. 由 Harness 独立识别失败归属，决定能否修复、提供什么反馈、何时必须终止；
+4. 在 Agent 之外证明工具是否满足合同、是否真实采用上游、是否可重放、现在是否
    允许被 RepoProof 受管发布。
 
 下一阶段不应该继续扩大验证系统，也不应该继续开发旧的“任意仓库适配到任意
@@ -39,7 +40,9 @@ DIRECT_WRAP      AGENT_ADAPT
 确定性生成        受限 Agent 实现
     └───────┬────────┘
             ↓
-同一 Tool Contract / Verifier / Receipt / Replay
+公开验证 → Failure Triage → 有界修复（仅 AGENT_ADAPT）
+            ↓
+同一 Tool Contract / Independent Verifier / Receipt / Replay
             ↓
 Verified Registry → CLI / MCP / Audit
 ```
@@ -98,6 +101,31 @@ RepoProof 不应 Fork 大型 Harness 改名，也不应只给 MCPify 加几组�
 容易解释、也最能证明独立贡献的做法，是通过窄接口选择性复用成熟组件，同时让
 RepoProof 掌握路由与最终判定。
 
+### 3.1 最新调研回答提出的三项功能，与当前盘面的真实关系
+
+最新详细回答建议只增加三项功能，这个收敛原则应直接采用，但不能把“新增功能”
+误解成三项都要从零开发：
+
+| 建议功能 | 当前盘面 | 后续动作 |
+|---|---|---|
+| Hybrid Capability Analyzer | repository/intake/support policy 已有零件，但没有正式 `DIRECT_WRAP / AGENT_ADAPT` 路由产物 | 新增 CapabilityPlanV1，形成证据化路由 |
+| Bounded Verification-Repair Loop | **核心机制已经存在且已进入 Local Tool 执行链**；当前合同默认 `max_rounds=3` | 不重写循环；补 Local Tool 失败分类、产品投影、证据与 Studio 呈现 |
+| Verified Tool Registry + MCP Export | M5/M6 已基本成立，包括双状态、package health、audit/withdraw/MCP | 保持 Core 单一事实源，只做新 plan/repair 字段的投影 |
+
+因此，最新回答中的产品闭环应理解为：
+
+```text
+Analyze → Plan → Execute → Public Verify
+                            ↓ FAIL
+                     Bounded Repair
+                            ↓
+Independent Verify → Replay → Release → Registry/MCP
+```
+
+其中 Analyzer 是下一阶段最主要的新能力，Repair 是已有 Harness 核心的产品化与
+收口，Registry 则是复用已完成资产。这样才能真正做到“只增加三个功能”，而不是
+在新名字下重复建设已有系统。
+
 ## 4. 当前已经成立的产品能力
 
 下面只列当前仓库已有代码、测试或提交支持的能力。
@@ -128,8 +156,10 @@ RepoProof 掌握路由与最终判定。
 - `support_policy.py` 已能给出四态准入；
 - `strategy_selector.py` 已有 Python adapter、CLI subprocess、HTTP sidecar 等
   策略概念；
-- 但 `tool_build()` 在 fake rehearsal 后固定发起一次真实 Agent 运行，没有
-  “这个仓库根本不需要 Agent”的正式路径；
+- `tool_build()` 在 fake rehearsal 后固定进入 AGENT_ADAPT 路线；该路线内部并非
+  单次“Agent → 判卷”，而是通过 `host_guided` 使用最多三轮的结构化修复循环；
+- 当前真正缺少的是“这个仓库根本不需要 Agent”的 DIRECT_WRAP 正式路径，以及
+  对 repair 的 Local Tool 产品级状态/证据呈现；
 - 当前 intake 更像“仓库是否大致可处理”，还没有证明“用户意图对应哪个
   callable、输入输出怎样映射、为什么选择这条实现路线”。
 
@@ -174,12 +204,10 @@ DIRECT_WRAP 不调用 Coding Agent，但仍必须经过同一合同、上游采�
 #### AGENT_ADAPT
 
 适用于 callable 明确，但需要有限输入转换、输出规范化、异常映射或依赖处理的
-任务。产品默认使用 mini-swe + API provider，并继续使用 RepoProof 自己的
-有界 repair、合同和验证体系；官方 Codex CLI 原生 agent loop 保留为网关故障回退后端。
+任务。它继续复用现有 mini-swe 主路径和验证体系。
 
-DSH 与旧宿主适配引擎一起冻结在 Benchmark Lab。除非出现当前两个产品后端都无法
-满足、且 DSH 能以可测方式消除的具体阻塞，不应把“资格化 DSH”设为产品 alpha
-的前置里程碑。
+DSH 保持 optional/experimental。除非出现 mini-swe 无法满足、且 DSH 能以可测
+方式消除的具体阻塞，不应把“资格化 DSH”设为产品 alpha 的前置里程碑。
 
 ### 5.3 四种面向用户的分析结论
 
@@ -264,10 +292,210 @@ human_confirmations:
 关闭条件：至少用 API 直包、CLI 信号、歧义仓、GPU/secret、service 五类零模型
 fixture 证明路由稳定、顺序无关、重复运行逐字节一致。
 
-### Gate 2：DIRECT_WRAP 确定性快路径
+### Gate 2：Failure Triage 与有界自主修复控制器
+
+目标：把盘上已经存在的“识别失败并自行修复”正式提升为 Local Tool 产品的一等
+Harness 能力。Agent 负责提出候选 patch；Harness 负责诊断、授权、反馈、度量进展
+和终止。不能让 Agent 用一句“我再试试”自行开启无限循环。
+
+本 Gate 不是新写第二套 repair loop。必须直接复用：
+
+- `failure_packet.py`：结构化、去原始日志、同根因折叠的公开反馈；
+- `repair_budget.py`：round/token/command/diff 硬预算；
+- `repair_loop.py`：最佳态、劣化回滚、停滞、scope change 和“循环不产 verdict”；
+- `host_guided.py`：逐轮公开测试/回归/违规反馈、git checkpoint、最终 hidden、
+  policy、receipt、clean replay 与 completion gate；
+- 现有 gated guided repair、constraint feedback 和 host-guided 测试。
+
+当前 `tool_host_bridge` 为 Local Tool 物化的执行合同默认 `max_rounds=3`，准确含义
+就是“初次实现 + 最多两次 repair”。后续应保留这一现行语义，避免再引入一个
+含义相同但计数方式不同的配置。
+
+本次报告修订对现有 repair 资产做了定向复核：
+
+```text
+.venv/bin/pytest -q \
+  tests/test_gated_guided_repair.py \
+  tests/adoption/test_admission_plan_gate_repair.py \
+  tests/test_gated_guided_e2e.py \
+  tests/test_constraint_feedback.py
+
+69 passed
+```
+
+这证明现有循环机制和约束反馈已有测试基础；它不等于新的 Local Tool 产品投影和
+`tool build` 全链 fixture 已经完成，后两项仍是本 Gate 的真实增量。
+
+#### 2.1 固定状态机
+
+沿用现行“初次实现 + 最多两次 repair”的硬上限，也就是最多验证三个候选版本：
+
+```text
+INITIAL_BUILD
+      ↓
+PUBLIC_VERIFY
+      ├─ PASS ───────────────────────→ INDEPENDENT_GATES
+      └─ FAIL
+           ↓
+     FAILURE_TRIAGE
+      ├─ non-repairable ─────────────→ TERMINATED
+      └─ repairable + budget remains
+           ↓
+     FAILURE_PACKET → REPAIR_ATTEMPT_1 → FULL_PUBLIC_VERIFY
+                              ├─ PASS → INDEPENDENT_GATES
+                              ├─ unsafe / budget exhausted → TERMINATED
+                              └─ fail（记录 progress / stagnation）
+                                      ↓
+                               REPAIR_ATTEMPT_2
+                                      ↓
+                               FULL_PUBLIC_VERIFY
+                              ├─ PASS → INDEPENDENT_GATES
+                              └─ FAIL → TERMINATED
+
+INDEPENDENT_GATES = held-out + policy + receipt + clean replay + completion gate
+```
+
+两次是预算上限，不是必须执行的次数。沿用现行 RepairLoop 的保守规则：第一次
+无改善先记一次 stagnation，仍允许最后一轮利用结构化失败包纠正；连续两轮无改善、
+触发硬违规或任何预算耗尽时停止。这样既避免第一次偶然无改善就过早结束，也绝不
+越过三轮上限。
+
+#### 2.2 失败分类与 owner
+
+现有 `FailurePacket` 已覆盖 dependency、API、schema、test、regression、resource、
+scope、timeout、shared-root-cause 和 rollback。新增的 `FailureAssessmentV1` 应是
+其上的产品投影和 owner 补全，不应替换或分叉现有 packet 生成器。它至少包含：
+
+- `failure_owner`：`AGENT | CONTRACT | USER | HARNESS | UPSTREAM | EXTERNAL`；
+- `repairability`：`REPAIRABLE | NON_REPAIRABLE | NEEDS_HUMAN`；
+- `reason_codes`：机器可判定的稳定代码；
+- `public_failure_fingerprint`：verifier、公开节点、规范化错误类型的摘要；
+- `progress_snapshot`：公开通过节点数、失败节点数、当前最早失败阶段；
+- `allowed_feedback` 与 `redacted_fields`；
+- `recommended_action`：`REPAIR | STOP | ASK_USER | RETRY_INFRASTRUCTURE`。
+
+初版允许 Harness 自动修复的范围：
+
+- import、语法、构建和公开接口错误；
+- 公开 capability 样例失败；
+- 公开合同已经要求的 exit code、stdout/stderr、异常映射错误；
+- 可公开说明的依赖锁缺失；
+- 上游采用失败的粗粒度公开原因，例如 `UPSTREAM_NOT_OBSERVED`、
+  `WRONG_PUBLIC_SYMBOL`、`OUTPUT_NOT_DERIVED_FROM_UPSTREAM`。不得暴露 nonce、密钥、
+  签名或隐藏输入。
+
+以下情况自动停止，不进入 repair：
+
+- 合同欠定、golden 不足或用户意图存在实质歧义；
+- license、GPU、secret、无法 pin 或支持面越界；
+- held-out 失败；只能报告 `HIDDEN_ACCEPTANCE_FAILED`，不反馈输入、期望或差分；
+- 读取 oracle/answer key、篡改 public/hidden verifier、上游树、Harness 或证据；
+- release ledger、package identity、provenance 根损坏；
+- Harness、provider、网络、磁盘或上游基础设施故障；
+- M7 的 OS 隔离或可信门本身尚未关闭。
+
+基础设施瞬时故障可以由操作者以后重新发起任务，但不能伪装成同一自主 repair，
+也不占用 Agent 失败次数。
+
+可恢复的约束错误需要单独区分：patch 超限、不可解析依赖、被 policy 拒绝但没有
+成功修改保护面等，可以形成公开 violation packet，让剩余轮次收缩 patch 或撤销
+错误依赖；同一约束连续不改善或实际保护面已被篡改时再确定性终止。
+
+#### 2.3 FailurePacketV1 只给最小公开反馈
+
+Agent 每轮只能收到：
+
+- 冻结的 public contract 与 public examples；
+- 失败的公开测试节点和稳定 reason code；
+- 规范化、去敏后的错误摘要；
+- 当前候选 diff、允许修改的文件和剩余 patch/token/time 预算；
+- 上一轮是否取得进展，以及必须解决的公开失败指纹。
+
+Agent 永远不能收到：held-out 输入/期望、oracle 源码、隐藏 receipt、签名密钥、
+完整私密 stdout、release ledger 内部材料，或能反推出真值的差分内容。
+
+#### 2.4 “是否有进展”的确定性规则
+
+修复不是只看 Agent 换了代码。只有至少满足一条才算 measurable progress：
+
+1. 公开失败节点数量减少；
+2. 上一轮失败指纹消失，且没有出现同等级或更早阶段的新失败；
+3. 最早失败阶段确定性后移，例如从 build/import 进入 interface/capability；
+4. 粗粒度 upstream adoption reason code 从失败变为通过。
+
+同时必须满足：没有新增 regression 或硬安全违规。可恢复的 patch/dependency
+约束必须在剩余轮次清零，最终仍由 policy gate 执法。出现以下任一情况停止：
+
+- 同一 public failure fingerprint 连续两轮出现；
+- 连续两轮通过节点不增、最早失败阶段不后移；
+- 修复反而引入更早阶段失败；
+- 实际篡改保护面，或累计文件/行数、token、wall time 超预算；
+- Agent 重复同类动作达到现有 `max_same_action`；
+- repair #2 后仍未通过完整公开验证。
+
+#### 2.5 终止结果必须可解释
+
+不要统一返回 `FAILED`，也不要直接改写已有内部 stop reason。建议为 Product Mode
+增加稳定映射：
+
+| 现有内部事实 / 新分类 | Product Mode 终止码 | 含义 |
+|---|---|---|
+| `all_public_green_pending_verification` + `rounds_used=1` + 最终 gate PASS | `NO_REPAIR_NEEDED` | 初次候选已通过，不能计入 repair rescue rate |
+| `all_public_green_pending_verification` + `rounds_used>1` + 最终 gate PASS | `REPAIR_SUCCEEDED` | 修复后独立门通过；成功仍由 completion gate 决定 |
+| non-repairable assessment | `STOP_NON_REPAIRABLE` | 失败类别不允许交给 Agent 修 |
+| `scope_change_pending_user` / needs-human assessment | `STOP_NEEDS_HUMAN` | 合同、样例、license、能力映射或范围变化需要人决策 |
+| `stagnation` / 重复失败指纹 | `STOP_NO_PROGRESS` | 连续无改善或同一公开根因重复 |
+| hard policy / protected-surface tamper / hard-signal regression | `STOP_SCOPE_DRIFT` | 实际越界、引入更早失败或触犯不可恢复 policy |
+| `max_rounds` / `budget_exhausted` | `STOP_BUDGET_EXHAUSTED` | 两次 repair、token、command、时间或 patch 预算耗尽 |
+| hidden acceptance FAIL | `STOP_HIDDEN_FAILURE` | held-out 失败，未向 Agent 泄露细节 |
+| missing external / interrupted | `STOP_HARNESS_OR_EXTERNAL` | Harness、provider、磁盘、网络或上游故障 |
+
+内部 stop reason、历史 run 和旧台账保持原样；Product Mode 只做新投影，不能为
+统一命名而回写历史。
+
+每个 attempt 都要 append-only 留下候选摘要、patch hash、公开 failure fingerprint、
+assessment、预算变化和终止理由。最终 evidence bundle 必须能回答“为什么修、修了
+什么、为什么继续、为什么停止”，不能只保存最后一次结果。
+
+#### 2.6 每轮修复必须隔离且可重放
+
+- 全系统仍只有一个自主 Agent loop；RepairLoop 是确定性编排器，不是 critic、
+  planner 或第二个 Agent；
+- 每轮调用使用冻结 base prompt + 本轮 FailurePacket，工作树按现行规则从上一轮
+  现场继续；只有硬信号严格劣化时才恢复最佳 git checkpoint；
+- 不要求每轮重建 venv/OS session。这样既复用当前实现，也避免不必要性能开销；
+  真正的环境独立性由循环结束后的 clean replay 负责；
+- Agent 只提交允许区内的 patch；Harness 继续做路径、文件类型、依赖探针和
+  patch budget 检查，并为每轮写 `repair/round-N/record.json`；
+- 每个候选继续记录 git commit/快照、prompt hash、backend/model、预算、diff、
+  failure packets 和验证结果；最终恢复 `best_round` 再进入独立验证；
+- 某轮被杀或状态无法确认时记 `INTERRUPTED`，不得把半轮结果当成最佳候选，也
+  不得自动补发模型调用；
+- DIRECT_WRAP 若失败，owner 应是 `HARNESS / CONTRACT / UPSTREAM` 之一，不自动切换
+  到 AGENT_ADAPT。改变路线需要重新生成并确认 Capability Plan。
+
+#### 2.7 修复效果单独记产品指标
+
+现有 run 已记录 `public_passed_by_round`、`regression_by_round`、`rounds_used`、
+`rollback_count`、`scope_change_count` 和 `stagnation`。在此基础上确定性派生
+`initial_public_pass`、`repair_attempted`、`rescued_at_attempt_1/2`、Product stop
+code、累计 token/time/patch size；不要再建第二份手工指标账。它们用于回答 Harness
+是否有效减少人工返工，但 Product run 仍不能进入 Benchmark Lab 模型能力成绩，
+也不能把 repair rescue rate 外推为任意仓库成功率。
+
+关闭条件：
+
+- 可修复 fixture 分别覆盖第 1 轮成功、第 2 轮成功；
+- 同指纹重复、无进展、scope drift 和预算耗尽均在预定点停止；
+- contract/user/harness/external/hidden failure 不触发 Agent repair；
+- 每次 repair 后完整重跑公开验证，最终再走全部独立门；
+- 泄漏负控、伪进展负控和篡改 attempt ledger 负控全数落网。
+
+### Gate 3：DIRECT_WRAP 确定性快路径
 
 目标：证明 RepoProof 不是“所有问题都交给 Agent”，而是一个会选择最低风险
-执行方式的 Harness。
+执行方式的 Harness。它排在修复控制器之后：失败识别和终止是核心 Harness
+能力，DIRECT_WRAP 是减少不必要 Agent 调用的高价值快路径。
 
 任务：
 
@@ -281,7 +509,7 @@ fixture 证明路由稳定、顺序无关、重复运行逐字节一致。
              ↓
        route executor
        ├─ direct compiler
-       └─ coding agent
+       └─ coding agent + bounded repair controller
              ↓
    verify / receipt / replay / export / registry
    ```
@@ -293,37 +521,6 @@ fixture 证明路由稳定、顺序无关、重复运行逐字节一致。
 
 关闭条件：一个本地 fixture 在零模型情况下取得 `PASS_DIRECT`，且 never-call、
 wrong-symbol、call-ignore-result、输出合同错误和 replay 漂移全部被拦截。
-
-### Gate 3：AGENT_ADAPT 的一次有界公开反馈修复
-
-目标：在不泄露 held-out 的前提下，让 Agent 对可修复的公开失败获得一次结构化
-反馈，提升稳定性而不制造无限自治循环。
-
-优先复用现有 `adoption/repair/failure_packet.py`、repair budget 和 guided repair
-资产，不复活旧宿主产品路线。
-
-首版只允许**一次**修复：
-
-```text
-initial candidate
-      ↓
-public verifier
-      ├─ PASS → independent hidden / policy / replay gates
-      └─ FAIL(agent-owned, public) → FailurePacketV1 → one repair
-                                             ↓
-                                      full verification again
-```
-
-可反馈：公开测试节点、稳定错误码、公开合同字段、允许修改的文件和剩余预算。
-
-不可反馈：held-out 输入/期望、oracle 源码、签名密钥、隐藏 receipt 细节、能够反推
-真值的差分内容。
-
-以下失败不得交给 Agent 反复试：合同不足、许可证/支持面问题、Harness 自身故障、
-ledger 或 package identity 损坏、held-out 失败、receipt 可信面缺失、OS 隔离缺口。
-
-关闭条件：公开可修复 fixture 能在一次修复内恢复；不可修复和 hidden failure
-诚实失败；泄漏负控全数落网；无第二轮、无隐式重试。
 
 ### Gate 4：Studio 收口与面试演示
 
@@ -339,7 +536,8 @@ ledger 或 package identity 损坏、held-out 失败、receipt 可信面缺失�
 固定准备三个演示：
 
 1. `DIRECT_WRAP`：已有 Python API，零模型完成并通过同一验证链；
-2. `AGENT_ADAPT`：需要少量 glue code，一次公开反馈后通过或诚实失败；
+2. `AGENT_ADAPT`：需要少量 glue code，由 Harness 诊断失败、度量进展并在最多
+   两次有界修复内通过或给出明确终止原因；
 3. `UNSUPPORTED` 或 historical READY/current REVOKED：展示 Harness 会拒绝、会撤回，
    而不是只展示成功案例。
 
@@ -360,7 +558,7 @@ ledger 或 package identity 损坏、held-out 失败、receipt 可信面缺失�
 ### 7.2 路由与执行
 
 - DIRECT_WRAP 不能触发 Agent backend；
-- AGENT_ADAPT 默认使用 mini-swe，Codex CLI 是显式回退后端；DSH 不进入 Product Mode；
+- AGENT_ADAPT 默认使用 mini-swe，DSH 未资格化时 fail closed；
 - 两条路径共享合同与最终 gate，不能各写一套“成功”；
 - route、backend、model invocation 和 Product/Lab 计分字段进入 run 元数据；
 - Product run 永不进入 Benchmark Lab 模型能力指标。
@@ -369,7 +567,10 @@ ledger 或 package identity 损坏、held-out 失败、receipt 可信面缺失�
 
 - 只消费公开 failure packet；
 - held-out 文本和 expected hash 不进入 Agent workspace、prompt、日志；
-- repair budget 到 0 后立即停止；
+- 初次实现后最多两次 repair，连续两轮没有 measurable progress 时停止；
+- failure owner、repairability、fingerprint、progress 和终止码均为确定性产物；
+- contract/user/harness/external/hidden failure 不触发 Agent repair；
+- repair budget 到 0 后立即停止，不存在隐式重试；
 - 修复后完整重跑，而不是只重跑原失败节点；
 - Harness-owned / external failure 不归咎 Agent。
 
@@ -435,10 +636,11 @@ M7 仍属于当前 Local Tool 产品，但它是 delivery profile 扩展，不�
 
 1. 输入 GitHub URL 与能力意图；
 2. 展示证据化 Capability Plan 和路线选择；
-3. 展示 DIRECT_WRAP 不调用模型，或 AGENT_ADAPT 只获得有限公开反馈；
+3. 展示 DIRECT_WRAP 不调用模型，或 AGENT_ADAPT 的失败如何被 Harness 分类、
+   修复、度量进展并在无进展时终止；
 4. 展示独立验证、receipt 与 replay；
 5. 展示 historical READY 但 current REVOKED 仍被 MCP 拦截；
-6. 最后再说明 Codex CLI/mini-swe 是可替换执行器，不是判官；DSH 是冻结研究资产。
+6. 最后再说明 mini-swe/DSH 是可替换执行器，不是判官。
 
 这个故事同时体现产品判断、Harness 设计、Agent 工程、可复现性和安全边界，技术
 含量明显高于“把函数包成 MCP”，范围又小于重做一个通用 Agent 平台。
@@ -452,11 +654,14 @@ M7 仍属于当前 Local Tool 产品，但它是 delivery profile 扩展，不�
 3. 基于现有 `tool_intake`、`repository_analyzer` 和 `support_policy` 实现五类
    零模型 fixture；
 4. 在 Core 增加 `analyze → plan → confirm`，先不接 Studio；
-5. 实现最窄的 Python callable DIRECT_WRAP 和 `PASS_DIRECT` 全链；
-6. 复用现有 failure packet，给 AGENT_ADAPT 接一次公开反馈修复；
+5. 把现有三轮 RepairLoop 正式接成 Local Tool 的 FailureAssessment/Product stop
+   code/Studio 投影，并补一个 `tool build` 全链 fixture；
+6. 实现最窄的 Python callable DIRECT_WRAP 和 `PASS_DIRECT` 全链；
 7. Core 门禁全绿后再把 plan 和 route 投影到现有 Studio；
 8. 最后准备三个固定演示，经单独授权后再决定是否跑一个新真实仓。
 
-如果时间只够完成一个新增里程碑，应选择 **CapabilityPlanV1 + DIRECT_WRAP**。
-它最直接地吸收同类项目优点，减少 Agent 不确定性，形成清晰的 Harness 决策层，
-而且可以完整复用 RepoProof 已经成熟的验证与发布治理资产。
+如果时间只够完成一个新增里程碑，应选择
+**CapabilityPlanV1 + Failure Triage / Bounded Repair Controller**。它最能体现
+Harness 不只是调用 Agent，而是在 Agent 失败后进行独立诊断、受控修复和确定性
+终止。这里的 Repair Controller 以复用现有三轮实现为主，工作量集中在 Local Tool
+接线、分类和产品呈现；DIRECT_WRAP 紧随其后，用于进一步减少模型依赖和提升稳定性。

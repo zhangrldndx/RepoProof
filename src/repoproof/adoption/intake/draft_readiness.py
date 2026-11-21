@@ -38,6 +38,7 @@ from repoproof.adoption.assembly.workspace_tool_assembler import (
     workspace_truth_binding_sha256,
 )
 from repoproof.adoption.delivery.product_profile import (
+    OPEN_API_WORKSPACE_PROFILE_ID,
     ProductProfileError,
     product_delivery_profile,
 )
@@ -51,7 +52,7 @@ from repoproof.adoption.intake.intent_contract import (
 )
 from repoproof.adoption.intake.upstream_pin import derive_reference_lock
 from repoproof.adoption.intake.workspace_fixtures import FixtureBlueprintV1
-from repoproof.domain.models import ToolOutputContract, ToolSpec
+from repoproof.domain.models import ToolOutputContract, ToolSpec, is_workspace_profile
 from repoproof.execution.workspace_bundle import (
     WorkspaceBundleError,
     build_artifact_manifest,
@@ -667,6 +668,49 @@ def _read_workspace_examples(
     return examples
 
 
+def _check_open_api_hosts(tool_doc: object, issues: list[_Issue]) -> None:
+    """An open-API draft names the hosts its producer may call before it freezes.
+
+    The sealed run maps exactly those hosts to the replay stub; a draft with none
+    would either fetch the real network or fail for every fixture, and neither is
+    a verdict.  Offline drafts never reach this check.
+    """
+    contract = tool_doc.get("workspace_contract") if isinstance(tool_doc, dict) else None
+    hosts = contract.get("open_api_hosts") if isinstance(contract, dict) else None
+    if not isinstance(hosts, list) or not any(str(item).strip() for item in hosts):
+        _append(
+            issues,
+            "OPEN_API_HOSTS_MISSING",
+            "D:open_api_workspace_v1 草稿必须在 workspace_contract.open_api_hosts 声明"
+            "生产者会调用的公开主机 —— 密封验证只把这些主机映射到回放桩",
+        )
+
+
+def _check_open_api_live_anchor(draft_dir: Path, issues: list[_Issue]) -> None:
+    """An open-API draft's fixture set names one real resource before it freezes.
+
+    The rehearsal's live probe asks today's host the recorded requests; invented
+    identifiers answer 404 whether or not the endpoint exists, so without an
+    anchor the probe cannot decide (incident-live-probe-misreads-fictional-resource-*).
+    """
+    source = _read_text(draft_dir / FIXTURE_BLUEPRINTS_JSON)
+    if source is None:
+        return  # the fixture-assets check already reports the missing file
+    try:
+        document = json.loads(source)
+        rows = document.get("blueprints") if isinstance(document, dict) else None
+        anchored = any(bool(item.get("live_anchor")) for item in rows or () if isinstance(item, dict))
+    except (ValueError, AttributeError):
+        return
+    if not anchored:
+        _append(
+            issues,
+            "OPEN_API_LIVE_ANCHOR_MISSING",
+            "D:open_api 草稿的夹具集必须有一个 live_anchor 场景(真实、公开、今天存在的标识)"
+            "—— 实况探针只能拿真实资源问主机端点是否还在",
+        )
+
+
 def _check_workspace_fixture_assets(
     draft_dir: Path,
     issues: list[_Issue],
@@ -787,7 +831,7 @@ def _compatibility(draft: dict) -> tuple[bool, bool, list[_Issue]]:
     delivery = _mapping(draft.get("_delivery_profile"))
     expected_version = (
         CURRENT_WORKSPACE_TOOL_SCHEMA_VERSION
-        if delivery.get("profile_id") == "workspace_bundle_v1"
+        if is_workspace_profile(delivery.get("profile_id"))
         else CURRENT_TOOL_SCHEMA_VERSION
     )
     current = raw_version == expected_version
@@ -943,9 +987,7 @@ def _evaluate(
         parsed_tool = None
         _append(issues, "TOOL_SPEC_INVALID", f"D:tool 分节非法:{exc}")
     output_contract: ToolOutputContract | None = None
-    workspace_profile = str(delivery.get("profile_id") or "") == (
-        "workspace_bundle_v1"
-    )
+    workspace_profile = is_workspace_profile(delivery.get("profile_id"))
     if current:
         raw_contract = output_interface.get("contract")
         if workspace_profile:
@@ -996,6 +1038,9 @@ def _evaluate(
     self_check: SelfCheckStatus = "NOT_APPLICABLE"
     if workspace_profile:
         _check_workspace_fixture_assets(draft_dir, issues, parsed_tool)
+        if str(delivery.get("profile_id") or "") == OPEN_API_WORKSPACE_PROFILE_ID:
+            _check_open_api_hosts(tool, issues)
+            _check_open_api_live_anchor(draft_dir, issues)
         # Machine-drafted controls must carry a current, passing self-check
         # before freezing.  Human review and confirmation stay open: the
         # issue only blocks ``ready``.
@@ -1009,6 +1054,16 @@ def _evaluate(
             )
 
     import_module = str(source_repo.get("import_module") or "")
+    if workspace_profile and not import_module.strip():
+        # An empty import module surfaced two self-check rounds later as a
+        # pydantic message; the checkout layout is a supply fact known now
+        # (incident-import-module-not-inferred-lib-layout-*).
+        _append(
+            issues,
+            "IMPORT_MODULE_UNKNOWN",
+            "D:source_repo.import_module 为空 —— intake 未能在检出里定位可导入包"
+            "(根目录/src/、pyproject package-dir、一级子目录都找过);请填写模块名后再自检",
+        )
     reference_source = _read_text(draft_dir / REFERENCE_PY)
     if reference_source is None:
         _append(issues, "REFERENCE_MISSING", f"D:{REFERENCE_PY} 缺失")

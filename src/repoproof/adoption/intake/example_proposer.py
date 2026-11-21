@@ -102,6 +102,40 @@ class ReferenceWheelhouseMaterializationError(ReferenceEnvironmentError):
     reason_code = "REFERENCE_WHEELHOUSE_MATERIALIZATION_FAILED"
 
 
+def _wheelhouse_failure(lock: Path, completed) -> ReferenceWheelhouseMaterializationError:
+    """The failure carries pip's own words: which pin, which index answer.
+
+    A bare「建立失败」reached the journey report as the whole story
+    (incident-wheelhouse-failure-without-pip-words-*).
+    """
+
+    try:
+        pins = [
+            line.strip()
+            for line in Path(lock).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    except (OSError, UnicodeError):
+        pins = []
+    stderr_lines = [
+        " ".join(line.split())[:240]
+        for line in str(getattr(completed, "stderr", "") or "").splitlines()
+        if line.strip()
+    ]
+    decisive = next(
+        (line for line in stderr_lines if "No matching distribution" in line),
+        next(
+            (line for line in stderr_lines if line.startswith("ERROR")),
+            stderr_lines[-1] if stderr_lines else "",
+        ),
+    )
+    error = ReferenceWheelhouseMaterializationError(
+        "参考依赖 wheelhouse 建立失败（HARNESS；尚未调用模型）。" + (f" {decisive}" if decisive else "")
+    )
+    error.diagnostics = [f"pins: {', '.join(pins) or '(none)'}", *stderr_lines[-5:]]
+    return error
+
+
 class ReferenceWheelhouseIntegrityError(ReferenceEnvironmentError):
     """A previously prepared reference wheel cache no longer matches."""
 
@@ -1131,9 +1165,7 @@ def ensure_reference_wheelhouse(
                 "参考依赖 wheelhouse 建立失败（HARNESS；尚未调用模型）。"
             ) from exc
         if downloaded.returncode != 0:
-            raise ReferenceWheelhouseMaterializationError(
-                "参考依赖 wheelhouse 建立失败（HARNESS；尚未调用模型）。"
-            )
+            raise _wheelhouse_failure(lock, downloaded)
         actual = _wheel_manifest(wheels)
         manifest = {
             "schema_version": 1,
@@ -1291,9 +1323,7 @@ def prepared_reference_environment(
                     "参考依赖 wheelhouse 建立失败（HARNESS；尚未调用模型）。"
                 ) from exc
             if downloaded.returncode != 0:
-                raise ReferenceWheelhouseMaterializationError(
-                    "参考依赖 wheelhouse 建立失败（HARNESS；尚未调用模型）。"
-                )
+                raise _wheelhouse_failure(lock, downloaded)
         elif not install_wheels.is_dir():
             raise ReferenceWheelhouseIntegrityError(
                 "参考 wheelhouse 不存在或身份无效（HARNESS；尚未调用模型）。"

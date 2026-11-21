@@ -22,7 +22,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from repoproof.domain.models import SemanticVerifierSpec, TaskContract
+from repoproof.domain.models import SemanticVerifierSpec, TaskContract, is_workspace_profile
 from repoproof.runner.tool_package_identity import (
     ToolPackageIdentityError,
     package_payload_sha256,
@@ -177,7 +177,7 @@ def validate_contract_schema_version(manifest: dict) -> int:
     value = manifest.get("contract_schema_version", 1)
     if type(value) is not int or value not in {1, 2, 3, 4}:
         raise ValueError("contract_schema_version 必须为 1、2、3 或 4")
-    if value == 4 and manifest.get("delivery_profile_id") != "workspace_bundle_v1":
+    if value == 4 and not is_workspace_profile(manifest.get("delivery_profile_id")):
         raise ValueError("contract_schema_version=4 必须声明 workspace_bundle_v1")
     return value
 

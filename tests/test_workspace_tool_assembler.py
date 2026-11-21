@@ -367,6 +367,14 @@ def test_workspace_assembler_freezes_v4_task_and_runs_public_controls(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # The frozen judge now runs as public acceptance (in the tool's runtime);
+    # it imports the pinned upstream, so a synthetic one sits on PYTHONPATH.
+    upstream_site = tmp_path / "upstream-site"
+    upstream_site.mkdir()
+    (upstream_site / "synthetic_upstream.py").write_text(
+        "def transform(text):\n    return text.upper()\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(upstream_site))
     tool = _tool()
     source_root, examples = _world(tmp_path)
     goal, intent = _intent(tool)
@@ -425,16 +433,18 @@ def test_workspace_assembler_freezes_v4_task_and_runs_public_controls(
     materialized_positive = (
         materialized_contract.parent / "controls" / "positive" / "impl.py"
     )
-    assert "_repoproof_reference_build_workspace_v1" in (
-        materialized_positive.read_text(encoding="utf-8")
+    # The positive control is a bridge over the reference kept byte for byte
+    # beside it (incident-positive-control-mutates-reference-*).
+    assert "impl_reference" in materialized_positive.read_text(encoding="utf-8")
+    assert (
+        materialized_positive.with_name("impl_reference.py").read_text(encoding="utf-8")
+        == (project / "controls" / result["task_id"] / "reference" / "impl.py").read_text(encoding="utf-8")
     )
     materialized_positive.write_text("stale derived control\n", encoding="utf-8")
     assert ensure_materialized_tool_controls_current(
         project, contract_path, materialized_contract
     ) is True
-    assert "_repoproof_reference_build_workspace_v1" in (
-        materialized_positive.read_text(encoding="utf-8")
-    )
+    assert "impl_reference" in materialized_positive.read_text(encoding="utf-8")
     assert ensure_materialized_tool_controls_current(
         project, contract_path, materialized_contract
     ) is False

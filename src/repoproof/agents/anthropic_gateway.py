@@ -100,6 +100,12 @@ class GatewayReply:
     usage: dict[str, int] = field(default_factory=dict)
     temperature_dropped: bool = False
     structured: bool = False
+    # Why the model stopped: a forced tool call cut by max_tokens is half a
+    # document, never a document (incident-draft-document-missing-required-field-unexplained-*).
+    stop_reason: str = ""
+
+
+OUTPUT_TRUNCATED = "OUTPUT_TRUNCATED"
 
 
 Transport = Callable[[str, bytes, dict[str, str], float], "tuple[int, bytes]"]
@@ -269,6 +275,7 @@ def _reply(
         "completion_tokens": int(raw_usage.get("output_tokens") or 0),
     }
 
+    stop_reason = str(document.get("stop_reason") or "")
     if schema is not None:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -277,11 +284,18 @@ def _reply(
                     raise AnthropicGatewayError(
                         STRUCTURED_OUTPUT_NOT_ENFORCED, "tool input is not an object"
                     )
+                if stop_reason == "max_tokens":
+                    raise AnthropicGatewayError(
+                        OUTPUT_TRUNCATED,
+                        f"the forced tool call stopped at max_tokens: output_tokens="
+                        f"{usage['completion_tokens']}; the tool input is a truncated document, not a document",
+                    )
                 return GatewayReply(
                     text=json.dumps(arguments, ensure_ascii=False),
                     usage=usage,
                     temperature_dropped=temperature_dropped,
                     structured=True,
+                    stop_reason=stop_reason,
                 )
         # A schema was requested and the provider answered with prose.  Accepting
         # it would recreate the reliability bug the schema exists to prevent.
@@ -296,6 +310,7 @@ def _reply(
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     return GatewayReply(
+        stop_reason=stop_reason,
         text="\n".join(part for part in texts if part),
         usage=usage,
         temperature_dropped=temperature_dropped,

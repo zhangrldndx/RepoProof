@@ -28,7 +28,7 @@ class _Probe:
 def _drive(monkeypatch, fresh: dict):
     calls: list[tuple[int, bool]] = []
 
-    def fake_candidates(draft_dir, *, n, offline):
+    def fake_candidates(draft_dir, *, n, offline, **_kw):
         calls.append((n, offline))
         if offline:
             return {"ok": True, "candidates": [{"a": 1}, {"b": 2}, {"c": 3}], "generation_id": "base"}

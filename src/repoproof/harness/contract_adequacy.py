@@ -25,7 +25,7 @@ from repoproof.adoption.assembly.output_contract import (
 from repoproof.adoption.intake.intent_contract import (
     validate_frozen_intent_projection,
 )
-from repoproof.domain.models import TaskContract
+from repoproof.domain.models import TaskContract, is_workspace_profile
 from repoproof.harness.requirement_spec import RequirementSpec
 
 INVALID_TASK_SPEC = "INVALID_TASK_SPEC"
@@ -327,7 +327,7 @@ def evaluate_adequacy(
                 )
             elif tool.schema_version == 4:
                 workspace_ok = (
-                    tool.delivery_profile_id == "workspace_bundle_v1"
+                    is_workspace_profile(tool.delivery_profile_id)
                     and tool.workspace_contract is not None
                 )
                 workspace_reasons: list[str] = []
@@ -353,7 +353,7 @@ def evaluate_adequacy(
                         if manifest.get("contract_schema_version") != 4:
                             workspace_ok = False
                             workspace_reasons.append("manifest schema is not v4")
-                        if manifest.get("delivery_profile_id") != "workspace_bundle_v1":
+                        if not is_workspace_profile(manifest.get("delivery_profile_id")):
                             workspace_ok = False
                             workspace_reasons.append("delivery profile projection differs")
                         expected_workspace = (

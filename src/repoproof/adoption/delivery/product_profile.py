@@ -21,14 +21,23 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from repoproof.domain.models import WORKSPACE_PROFILE_IDS as _WORKSPACE_PROFILE_IDS
 from repoproof.domain.models import (
+    NetworkMode,
     OutputFieldType,
     TextValidationProfile,
     ToolOutputContract,
 )
+from repoproof.domain.models import is_workspace_profile as _is_workspace_profile
 
 CLI_V2_PROFILE_ID = "cli_v2"
 WORKSPACE_BUNDLE_PROFILE_ID = "workspace_bundle_v1"
+# A workspace whose runtime may GET the credential-free public hosts its
+# contract declares.  A separate profile, so the offline evidence behind
+# every workspace_bundle_v1 tool stays exactly what it was.
+OPEN_API_WORKSPACE_PROFILE_ID = "open_api_workspace_v1"
+WORKSPACE_PROFILE_IDS = _WORKSPACE_PROFILE_IDS
+is_workspace_profile = _is_workspace_profile
 DELIVERY_SUPPORTED = "SUPPORTED"
 DELIVERY_UNSUPPORTED = "UNSUPPORTED"
 
@@ -95,7 +104,10 @@ class DeliveryRequirements(BaseModel):
 
     inputs: tuple[DeliveryInputRequirement, ...] = Field(min_length=1, max_length=4)
     outputs: tuple[DeliveryOutputRequirement, ...] = Field(min_length=1, max_length=4)
-    network: Literal["offline", "required"]
+    # offline: no network at runtime.  open_api: GET-only access to the
+    # credential-free public hosts the workspace contract declares.  required:
+    # anything beyond that (credentialled, writes, arbitrary hosts) — not admitted.
+    network: NetworkMode
     credentials: Literal["none", "required"]
     lifecycle: Literal["per_invocation", "long_running"]
     runtime: Literal["local_cpu", "gpu", "remote_service"]
@@ -110,12 +122,12 @@ class ProductDeliveryProfile(BaseModel):
 
     schema_version: int = 1
     profile_id: str
-    input_kind: Literal["file", "file_or_directory"] = "file"
+    input_kind: Literal["file", "directory", "file_or_directory"] = "file"
     input_cardinality: Literal[1] = 1
     output_kind: Literal["stdout", "directory"] = "stdout"
     output_cardinality: Literal[1] = 1
     output_transport: Literal["utf8_text", "filesystem"] = "utf8_text"
-    network: Literal["offline"] = "offline"
+    network: Literal["offline", "open_api"] = "offline"
     credentials: Literal["none"] = "none"
     lifecycle: Literal["per_invocation"] = "per_invocation"
     runtime: Literal["local_cpu"] = "local_cpu"
@@ -173,7 +185,7 @@ class ProductDeliveryProfile(BaseModel):
         allowed_input_kinds = (
             {"file", "directory"}
             if self.input_kind == "file_or_directory"
-            else {"file"}
+            else {self.input_kind}
         )
         if (
             input_requirement.kind not in allowed_input_kinds
@@ -233,7 +245,11 @@ class ProductDeliveryProfile(BaseModel):
                     "workspace_contract_required": True,
                     "allowed_artifacts": [{
                         "format_id": "workspace_bundle",
-                        "display_name": "离线多文件工作区",
+                        "display_name": (
+                            "可访问公开 API 的多文件工作区"
+                            if self.network == "open_api"
+                            else "离线多文件工作区"
+                        ),
                         "extension": "",
                         "media_type": "application/vnd.repoproof.workspace",
                     }],
@@ -244,6 +260,11 @@ class ProductDeliveryProfile(BaseModel):
                 "runtime": self.runtime,
                 "browser": self.browser,
                 "external_side_effects": self.external_side_effects,
+                **(
+                    {"open_api_rules": OPEN_API_RULES}
+                    if self.network == "open_api"
+                    else {}
+                ),
             }
 
         return {
@@ -595,6 +616,34 @@ _CLI_V2 = ProductDeliveryProfile(
     ),
 )
 
+# The public contract of an open-API workspace, sent verbatim to the drafting
+# model and enforced by the sealed run.  Generic by construction: hosts, not
+# platforms; GET, not sessions; a snapshot per invocation, not a daemon.
+OPEN_API_RULES: dict[str, str] = {
+    "hosts": (
+        "Every host the tool talks to at runtime is listed in "
+        "workspace_contract.open_api_hosts (lowercase host names, no scheme, no "
+        "path).  Any other host is blocked by the sealed run."
+    ),
+    "method": "GET only; no credentials, no tokens, no cookies, no writes to any remote system.",
+    "base_url_override": (
+        "Read the environment variable named by the contract's base_url_override_env; "
+        "when set it maps each allowed host to a local replay server base URL "
+        "(http://127.0.0.1:PORT/<host>) and MUST be honoured, so verification never "
+        "leaves the machine."
+    ),
+    "fetched_at": (
+        "Never read the wall clock.  Timestamps in outputs come from response "
+        "headers or the fixture manifest, so the same responses always give the "
+        "same bytes."
+    ),
+    "history": (
+        "Each invocation is one snapshot; the previous run's output may arrive inside "
+        "the input directory under previous/ and is folded into history/ — the output "
+        "is still a pure function of the input directory plus the responses."
+    ),
+}
+
 _WORKSPACE_BUNDLE_V1 = ProductDeliveryProfile(
     profile_id=WORKSPACE_BUNDLE_PROFILE_ID,
     input_kind="file_or_directory",
@@ -614,10 +663,34 @@ _WORKSPACE_BUNDLE_V1 = ProductDeliveryProfile(
 )
 
 
+_OPEN_API_WORKSPACE_V1 = ProductDeliveryProfile(
+    profile_id=OPEN_API_WORKSPACE_PROFILE_ID,
+    # The input is a directory by construction: the user's configuration
+    # file(s) live inside it and the Harness places __responses__ beside them
+    # (incident-open-api-input-kind-unconstrained-*).
+    input_kind="directory",
+    output_kind="directory",
+    output_transport="filesystem",
+    network="open_api",
+    output_artifacts=(
+        OutputArtifactSpec(
+            format_id="workspace_bundle",
+            display_name="可访问公开 API 的多文件工作区",
+            format_name="workspace directory",
+            extension="",
+            media_type="application/vnd.repoproof.workspace",
+            root_type="text",
+            aliases=("workspace", "directory", "project folder", "dashboard workspace"),
+        ),
+    ),
+)
+
+
 def product_delivery_profile(profile_id: str = CLI_V2_PROFILE_ID) -> ProductDeliveryProfile:
     profiles = {
         CLI_V2_PROFILE_ID: _CLI_V2,
         WORKSPACE_BUNDLE_PROFILE_ID: _WORKSPACE_BUNDLE_V1,
+        OPEN_API_WORKSPACE_PROFILE_ID: _OPEN_API_WORKSPACE_V1,
     }
     try:
         return profiles[profile_id]
@@ -641,7 +714,14 @@ def select_product_delivery_profile(
     output_kinds = {item.kind for item in requirements.outputs}
     output_formats = {item.format_id for item in requirements.outputs}
     if output_kinds == {"directory"} or "workspace_bundle" in output_formats:
-        selected = _WORKSPACE_BUNDLE_V1
+        # Topology first, then the one network dimension that changes the
+        # profile: a directory deliverable that reads public hosts is the open-API
+        # workspace; "required" stays inadmissible and is reported by admission.
+        selected = (
+            _OPEN_API_WORKSPACE_V1
+            if requirements.network == "open_api"
+            else _WORKSPACE_BUNDLE_V1
+        )
     else:
         selected = _CLI_V2
     selected.admit_requirements(requirements)
@@ -707,7 +787,14 @@ def assess_requirement_brief(
     if not input_format:
         raise ProductProfileError("BRIEF_FIELD_EMPTY")
     input_label = input_format if input_format.lower().endswith(("文件", "file")) else f"{input_format} 文件"
-    if selected.output_kind == "directory":
+    if selected.output_kind == "directory" and selected.network == "open_api":
+        text = (
+            f"{scenario}。每次输入一个本地{input_format}文件或配置目录，"
+            "运行期只读取合同白名单内的公开 API（免凭证、仅 GET），"
+            "输出一套多文件工作区；每次调用独立运行，不常驻。"
+            f"主要边界是{boundary}。"
+        )
+    elif selected.output_kind == "directory":
         text = (
             f"{scenario}。每次输入一个本地{input_format}文件或资料目录，"
             "输出一套离线多文件工作区；每次调用独立运行。"

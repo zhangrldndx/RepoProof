@@ -17,14 +17,6 @@ from repoproof.adoption.admission.intent_risk_policy import (
             "UNSUPPORTED_CREDENTIALLED_EXTERNAL_SIDE_EFFECT",
         ),
         (
-            "Download the latest records from the online API.",
-            "UNSUPPORTED_RUNTIME_NETWORK_REQUIRED",
-        ),
-        (
-            "从在线 API 下载最新记录并生成本地报告。",
-            "UNSUPPORTED_RUNTIME_NETWORK_REQUIRED",
-        ),
-        (
             "Use browser automation to complete this workflow.",
             "UNSUPPORTED_BROWSER_REQUIRED",
         ),
@@ -54,6 +46,25 @@ def test_explicit_unsupported_delivery_dimensions_have_stable_reasons(
 
     assert result.supported is False
     assert reason_code in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "Download the latest records from the online API.",
+        "从在线 API 下载最新记录并生成本地报告。",
+        "从公开的天气 API 获取未来七天预报，生成一个本地看板。",
+    ],
+)
+def test_reading_a_public_api_is_the_open_api_network_mode(goal: str) -> None:
+    """Support-surface change (m6.4, operator-authorised): reading a credential-free
+    public interface is admitted by open_api_workspace_v1 instead of rejected.  The
+    two rows above used to assert UNSUPPORTED_RUNTIME_NETWORK_REQUIRED."""
+
+    result = classify_product_intent_risk(goal)
+
+    assert result.supported is True
+    assert result.network == "open_api"
 
 
 def test_local_offline_workspace_intent_is_not_rejected_by_keyword_guessing() -> None:

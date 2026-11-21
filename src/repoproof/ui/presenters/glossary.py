@@ -152,6 +152,7 @@ ADMISSION = {
     "READY": {"icon": "✅", "title": "可以开始尝试适配"},
     "NEED_INFO": {"icon": "🟡", "title": "还需要补充一些信息"},
     "UNSUPPORTED": {"icon": "❌", "title": "当前版本暂不支持"},
+    "NEED_REFRAME": {"icon": "↪️", "title": "碰到支持面边界，系统给出了可接受的改写"},
     "RISK_REVIEW": {"icon": "🟡", "title": "存在风险,需要你确认"},
 }
 

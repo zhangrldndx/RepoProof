@@ -64,3 +64,6 @@ tool_tasks/
 # 本机临时件(浏览器 CLI 日志、个人笔记),与产品/证据无关
 .playwright-cli/
 _local_notes/
+
+# --- local agent/editor config (auto-running hooks must not ship) ---
+.claude/

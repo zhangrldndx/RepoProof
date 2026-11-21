@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from repoproof.domain.models import is_workspace_profile
 from repoproof.harness.trace import verify_chain
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -55,7 +56,7 @@ def _emit_tool_action(
             journey_id = str(getattr(args, "journey_id", "") or "")
             semantic_ok = exit_code == 0 and bool(payload.get("ok", True))
             result: ProductActionResult
-            if delivery_profile_id == "workspace_bundle_v1":
+            if is_workspace_profile(delivery_profile_id):
                 result = workspace_action_result_from_payload(
                     job_id=job_id,
                     journey_id=journey_id,
@@ -197,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
                         exception_reason_code(type(exc).__name__),
                     ],
                     "exception_type": type(exc).__name__,
+                    # The exception's own bounded facts (which pin, which
+                    # index answer) travel with the code, never only the class.
+                    "diagnostics": [
+                        str(row)[:240] for row in (getattr(exc, "diagnostics", None) or [])
+                    ][:8],
                     "exit_code": 3,
                 },
                 ensure_ascii=False,
@@ -206,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
 
-def _dispatch(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The one argparse tree every verb hangs on (importable, so tests can parse without dispatching)."""
+
     parser = argparse.ArgumentParser(prog="repoproof")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -292,6 +300,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         default=None,
         help=argparse.SUPPRESS,
     )
+    pt_add.add_argument(
+        "--known-boundaries-json",
+        default=None,
+        help=argparse.SUPPRESS,  # rehearsal boundaries a redraft must not repeat (autopilot-fed)
+    )
     pt_add.add_argument("--fake-drafter", action="store_true",
                         help="确定性模板起草(零 API)")
     _add_product_result_args(pt_add)
@@ -353,6 +366,12 @@ def _dispatch(argv: list[str] | None = None) -> int:
                          choices=["draft", "confirm_examples", "confirm_intent", "freeze_wheelhouse",
                                   "rehearsal", "real_build", "fresh_audit", "final"])
     pt_auto.add_argument("--expect-admission-rejection", action="store_true")
+    pt_auto.add_argument(
+        "--accept-boundary-proposal",
+        action="store_true",
+        help="彩排实况边界(凭证/端点)时代用户接受提案 ②:带已知边界重新起草一次",
+    )
+    pt_auto.add_argument("--known-boundaries-json", default=None, help=argparse.SUPPRESS)
     pt_auto.add_argument("--batch", default="EXPLORATORY_UNPREREGISTERED")
     pt_auto.add_argument("--agent-backend", choices=["codex-cli", "mini-swe"], default="mini-swe")
     pt_auto.add_argument("--record-dir", type=Path, default=None)
@@ -534,6 +553,23 @@ def _dispatch(argv: list[str] | None = None) -> int:
                              "AgentBackend(B-dsh 代际,只接 deepseek-native provider,"
                              "发次不计模型能力池)")
 
+    return parser
+
+
+def _parse_known_boundaries(raw: str | None) -> list[dict]:
+    """Boundary rows handed to a journey from outside (earlier journeys of the same case)."""
+
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return [row for row in parsed if isinstance(row, dict)] if isinstance(parsed, list) else []
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.cmd == "baseline":
@@ -735,6 +771,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 revision=args.revision,
                 until=args.until,
                 expect_admission_rejection=args.expect_admission_rejection,
+                accept_boundary_proposal=bool(getattr(args, "accept_boundary_proposal", False)),
+                known_boundaries=_parse_known_boundaries(getattr(args, "known_boundaries_json", None)),
                 batch=args.batch,
                 agent_backend=args.agent_backend,
                 record_dir=args.record_dir,
@@ -764,6 +802,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
             from repoproof.adoption.intake.tool_intake import run_tool_intake
 
             authoritative_delivery_requirements = None
+            known_boundaries: list[dict] = []
+            if getattr(args, "known_boundaries_json", None):
+                try:
+                    parsed_boundaries = json.loads(args.known_boundaries_json)
+                except json.JSONDecodeError:
+                    parsed_boundaries = None
+                if not isinstance(parsed_boundaries, list):
+                    return _emit_tool_action(
+                        args,
+                        action="tool-add",
+                        payload={
+                            "ok": False,
+                            "failure_owner": "USER_INPUT",
+                            "reason_codes": ["KNOWN_BOUNDARIES_JSON_INVALID"],
+                            "error": "已知边界必须是 JSON 数组。",
+                        },
+                        exit_code=3,
+                    )
+                known_boundaries = [row for row in parsed_boundaries if isinstance(row, dict)]
             if args.delivery_requirements_json is not None:
                 try:
                     parsed_requirements = json.loads(args.delivery_requirements_json)
@@ -814,6 +871,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     authoritative_delivery_requirements=(
                         authoritative_delivery_requirements
                     ),
+                    known_boundaries=known_boundaries or None,
                 )
             except DraftError as exc:
                 add_payload["draft_error"] = str(exc)

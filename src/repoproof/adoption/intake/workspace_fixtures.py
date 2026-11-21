@@ -153,6 +153,13 @@ class FixtureBlueprintV1(BaseModel):
     scenario: str = Field(min_length=1, max_length=1200)
     input_kind: Literal["file", "directory"]
     parameters: dict[str, Any] = Field(default_factory=dict)
+    # An open-API scenario whose identifiers (repositories, accounts, ids,
+    # place codes) are real, public and known to exist today.  Fixture
+    # identifiers are otherwise invented by design, so the rehearsal's live
+    # probe can only tell "endpoint gone" from "resource never existed" by
+    # asking the real host about a real resource
+    # (incident-live-probe-misreads-fictional-resource-*).
+    live_anchor: bool = False
 
     @field_validator("blueprint_id")
     @classmethod
@@ -225,6 +232,25 @@ _PATH_VALUE_FIELDS = frozenset(
 )
 
 
+_REQUEST_ROW_KEYS = frozenset({"path", "paths", "query"})
+
+
+def _parameter_field_name(parent: dict, key: object) -> str:
+    """A ``path`` beside a ``host`` is a request key, not a fixture file path.
+
+    Recorded open-API responses are parameters too; their URL paths begin with
+    a slash and must stay exactly what the producer will ask for.  The
+    portable-path projection once rewrote them into fixture-<hash> aliases and
+    the recording could never match a request
+    (incident-blueprint-sanitiser-mangles-request-path-*).
+    """
+
+    name = str(key).lower()
+    if "host" in parent and name in _REQUEST_ROW_KEYS:
+        return "request_key"
+    return name
+
+
 def _portable_path_map(seed_values: tuple[object, ...]) -> bool:
     dictionaries = [value for value in seed_values if isinstance(value, dict)]
     if not dictionaries:
@@ -271,7 +297,7 @@ def _project_parameter_paths(
             projected[projected_key] = _project_parameter_paths(
                 child,
                 seed_values=child_seeds,
-                field_name=str(key).lower(),
+                field_name=_parameter_field_name(value, key),
             )
         return projected
     if isinstance(value, list):
@@ -343,7 +369,7 @@ def _validate_parameter_paths(
             _validate_parameter_paths(
                 child,
                 seed_values=child_seeds,
-                field_name=str(key).lower(),
+                field_name=_parameter_field_name(value, key),
             )
         return
     if isinstance(value, list):
@@ -513,6 +539,16 @@ def build_fixture_candidate(
             identity = snapshot_admitted_path(generated, destination)
         except WorkspaceBundleError as exc:
             raise FixtureBuilderError(exc.code, exc.detail) from exc
+        if identity.kind != blueprint.input_kind:
+            # The builder's own defect, named for the builder repair: a
+            # pydantic message here once became the public code and ended a
+            # journey with no repair route (incident-public-code-is-exception-text-*).
+            raise FixtureBuilderError(
+                "FIXTURE_BUILDER_OUTPUT_KIND_MISMATCH",
+                f"blueprint {blueprint.blueprint_id!r} declares input_kind={blueprint.input_kind!r} "
+                f"but the builder wrote a {identity.kind}; write one file for 'file' blueprints and "
+                "a directory for 'directory' blueprints",
+            )
 
     return InputFixtureCandidateV1(
         blueprint=blueprint,
@@ -599,3 +635,309 @@ def remove_unconfirmed_fixture(candidate: InputFixtureCandidateV1) -> None:
         shutil.rmtree(path)
     elif path.is_file():
         path.unlink()
+
+
+# Boundary codes that are walls: no fixture may record such an endpoint again.
+# Credentials and gone endpoints cannot be drafted around; a drifted shape is a
+# fact the rules teach.
+BLOCKING_BOUNDARY_CODES = frozenset({"PLATFORM_REQUIRES_CREDENTIALS", "ENDPOINT_GONE", "METHOD_NOT_ALLOWED"})
+
+
+RECORDED_KEYS_LIMIT = 64
+
+
+def manifest_request_keys(fixture_root: Path) -> list[str]:
+    """``METHOD host/path?canonical-query`` for every row a materialised fixture records (no bodies)."""
+
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME, canonical_query
+
+    manifest = Path(fixture_root) / RESPONSES_DIRNAME / "manifest.json"
+    if manifest.is_symlink() or not manifest.is_file():
+        return []
+    try:
+        rows = json.loads(manifest.read_text(encoding="utf-8")).get("responses") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    keys: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        host = str(row.get("host") or "").strip().lower()
+        if not host:
+            continue
+        path = "/" + str(row.get("path") or "").strip().lstrip("/")
+        query = canonical_query(str(row.get("query") or ""))
+        method = str(row.get("method") or "GET").upper()
+        keys.add(f"{method} {host}{path}" + (f"?{query}" if query else ""))
+    return sorted(keys)[:RECORDED_KEYS_LIMIT]
+
+
+def blocked_boundary_endpoints(known_boundaries) -> dict[tuple[str, str], str]:
+    """``(host, path) -> code`` for the boundaries that are walls."""
+
+    blocked: dict[tuple[str, str], str] = {}
+    for row in known_boundaries or ():
+        if not isinstance(row, dict) or str(row.get("code") or "") not in BLOCKING_BOUNDARY_CODES:
+            continue
+        host = str(row.get("host") or "").strip().lower()
+        path = "/" + str(row.get("path") or "").strip().lstrip("/")
+        if host:
+            blocked.setdefault((host, path), str(row.get("code")))
+    return blocked
+
+
+def assert_recordings_avoid_known_boundaries(
+    fixture_path: Path, known_boundaries: list[dict] | tuple[dict, ...], *, fixture_id: str
+) -> None:
+    """No materialised recording may target an endpoint an earlier rehearsal proved unusable.
+
+    The blueprint-level gate reads request rows; a builder whose *code*
+    assembles the requests recorded the gone endpoint again and the journey
+    hit the same wall a second time
+    (incident-known-boundary-reused-by-builder-code-*).
+    """
+
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME
+
+    blocked = blocked_boundary_endpoints(known_boundaries)
+    if not blocked:
+        return
+    manifest = Path(fixture_path) / RESPONSES_DIRNAME / "manifest.json"
+    if not manifest.is_file():
+        return
+    try:
+        rows = json.loads(manifest.read_text(encoding="utf-8")).get("responses") or []
+    except (OSError, ValueError, AttributeError):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        host = str(row.get("host") or "").strip().lower()
+        path = "/" + str(row.get("path") or "").strip().lstrip("/")
+        code = blocked.get((host, path))
+        if code is None:
+            continue
+        raise WorkspaceBundleError(
+            "FIXTURE_RECORDS_KNOWN_BOUNDARY",
+            f"{host}{path}",
+            diagnostics=(
+                f"fixture {fixture_id} records GET {host}{path}, which the rehearsal proved {code}; "
+                "record a usable endpoint instead — and the producer must call that one",
+            ),
+        )
+
+
+def assert_recordings_well_formed(fixture_path: Path, *, fixture_id: str) -> None:
+    """A recorded body of under two bytes, or JSON that does not parse, is the builder's defect.
+
+    Raised before any producer runs: a producer cannot decode what was never
+    written, and blaming it for six rounds taught nobody anything
+    (incident-degenerate-recording-blamed-on-producer-*).
+    """
+
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME
+    from repoproof.execution.workspace_bundle import WorkspaceBundleError
+
+    responses = Path(fixture_path) / RESPONSES_DIRNAME
+    manifest = responses / "manifest.json"
+    if not manifest.is_file():
+        return
+    try:
+        rows = json.loads(manifest.read_text(encoding="utf-8")).get("responses") or []
+    except (OSError, ValueError, AttributeError):
+        return  # the replay stub reports an unreadable manifest itself
+    problems: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("body") or "")
+        body_path = responses / name
+        if not name or not body_path.is_file():
+            continue
+        size = body_path.stat().st_size
+        content_type = str(row.get("content_type") or "").lower()
+        if size < 2:
+            problems.append(f"{fixture_id}/{RESPONSES_DIRNAME}/{name}: {size} byte(s) — a degenerate body")
+            continue
+        if "json" in content_type:
+            try:
+                json.loads(body_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                problems.append(f"{fixture_id}/{RESPONSES_DIRNAME}/{name}: declared {content_type} but does not parse")
+    if problems:
+        raise WorkspaceBundleError(
+            "FIXTURE_RECORDING_DEGENERATE",
+            problems[0],
+            diagnostics=(
+                "the builder wrote a recorded body no producer could read; fix the builder's encoding "
+                "of that body, never the producer",
+                *problems[:8],
+            ),
+        )
+
+
+_FRONTEND_ASSET_MIN_BYTES = 1024
+
+
+def assert_frontend_assets_from_upstream(expected_dir: Path, upstream_dir: Path) -> None:
+    """Every delivered .js/.css of 1 KB or more is a file the pinned upstream ships, byte for byte.
+
+    A library written from memory has no truth to check against; when the
+    upstream ships none, the interactive form is the boundary to propose
+    (incident-fabricated-frontend-asset-*).
+    """
+
+    import hashlib
+
+    from repoproof.execution.workspace_bundle import WorkspaceBundleError
+
+    expected_dir = Path(expected_dir)
+    delivered = [
+        path
+        for path in sorted(expected_dir.rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in {".js", ".css"}
+        and path.stat().st_size >= _FRONTEND_ASSET_MIN_BYTES
+    ]
+    if not delivered:
+        return
+    upstream_dir = Path(upstream_dir)
+    shipped: set[str] = set()
+    if upstream_dir.is_dir():
+        for path in upstream_dir.rglob("*"):
+            if path.is_file() and path.suffix.lower() in {".js", ".css"} and ".git" not in path.parts:
+                try:
+                    shipped.add(hashlib.sha256(path.read_bytes()).hexdigest())
+                except OSError:
+                    continue
+    foreign = [
+        path.relative_to(expected_dir).as_posix()
+        for path in delivered
+        if hashlib.sha256(path.read_bytes()).hexdigest() not in shipped
+    ]
+    if foreign:
+        raise WorkspaceBundleError(
+            "FRONTEND_ASSET_NOT_FROM_UPSTREAM",
+            foreign[0],
+            diagnostics=(
+                f"FRONTEND_ASSET_NOT_FROM_UPSTREAM: {', '.join(foreign[:4])} — not shipped by the pinned upstream; "
+                "a library written from memory has no truth to verify against, and the sealed delivery "
+                "cannot fetch one: deliver a static image plus data files instead",
+            ),
+        )
+
+
+_FONT_SUBTYPE_RE = re.compile(rb"/Subtype\s*/(Type1|MMType1|TrueType|Type0|Type3|CIDFontType0|CIDFontType2)\b")
+_FONT_FILE_RE = re.compile(rb"/FontFile[23]?\b")
+_STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
+
+
+def _pdf_font_kinds(payload: bytes) -> tuple[set[str], bool]:
+    """(font subtypes seen, any embedded font program) across raw objects and inflated streams."""
+
+    import zlib
+
+    chunks = [payload]
+    for index, match in enumerate(_STREAM_RE.finditer(payload)):
+        if index >= 64:
+            break
+        try:
+            chunks.append(zlib.decompress(match.group(1)))
+        except zlib.error:
+            continue
+    subtypes: set[str] = set()
+    embedded = False
+    for chunk in chunks:
+        subtypes.update(m.group(1).decode("ascii") for m in _FONT_SUBTYPE_RE.finditer(chunk))
+        if _FONT_FILE_RE.search(chunk):
+            embedded = True
+    return subtypes, embedded
+
+
+def non_latin_samples(texts, *, limit: int = 8) -> list[str]:
+    """Runs of letters outside the Latin ranges found in the user's text (CJK, Kana, Hangul, Arabic…)."""
+
+    import unicodedata
+
+    samples: list[str] = []
+    for text in texts:
+        run = ""
+        for char in str(text):
+            if ord(char) >= 0x0370 and unicodedata.category(char).startswith("L"):
+                run += char
+                continue
+            if len(run) >= 2 and run not in samples:
+                samples.append(run[:12])
+            run = ""
+        if len(run) >= 2 and run not in samples:
+            samples.append(run[:12])
+        if len(samples) >= limit:
+            break
+    return samples[:limit]
+
+
+def pdf_missing_input_script(pdf_path: Path, input_texts) -> list[str]:
+    """Non-Latin text from the input that this PDF cannot show: its fonts are the 14 core Type1 only.
+
+    A PDF whose only fonts are the built-in Type1 set has no glyphs for CJK and
+    the like; one with any embedded TrueType/Type0/Type3 font is left to the
+    judge (incident-pdf-cannot-render-input-script-*).
+    """
+
+    samples = non_latin_samples(input_texts)
+    if not samples:
+        return []
+    try:
+        payload = Path(pdf_path).read_bytes()
+    except OSError:
+        return []
+    subtypes, embedded = _pdf_font_kinds(payload)
+    if not subtypes or embedded or (subtypes - {"Type1", "MMType1"}):
+        return []
+    return samples
+
+
+def assert_pdf_shows_input_script(pdf_path: Path, input_texts, *, relative: str) -> None:
+    from repoproof.execution.workspace_bundle import WorkspaceBundleError
+
+    missing = pdf_missing_input_script(pdf_path, input_texts)
+    if missing:
+        raise WorkspaceBundleError(
+            "PDF_CANNOT_RENDER_INPUT_SCRIPT",
+            relative,
+            diagnostics=(
+                f"PDF_CANNOT_RENDER_INPUT_SCRIPT: {relative} uses only the built-in Type1 fonts, which have no "
+                f"glyphs for the user's own text ({', '.join(missing[:4])}); no font the pinned upstream ships "
+                "can show it — deliver an HTML print page (the browser supplies fonts) instead of a PDF",
+            ),
+        )
+
+
+def input_text_samples(input_path: Path, *, limit_bytes: int = 200_000) -> list[str]:
+    """Text file contents of an input directory (recordings excluded), bounded, for script checks."""
+
+    from repoproof.execution.open_api_replay import RESPONSES_DIRNAME
+
+    root = Path(input_path)
+    if root.is_file():
+        candidates = [root]
+    else:
+        candidates = [p for p in sorted(root.rglob("*")) if p.is_file() and RESPONSES_DIRNAME not in p.parts]
+    texts: list[str] = []
+    budget = limit_bytes
+    for path in candidates:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if b"\x00" in raw[:4096]:
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        texts.append(text[:budget])
+        budget -= len(text)
+        if budget <= 0:
+            break
+    return texts

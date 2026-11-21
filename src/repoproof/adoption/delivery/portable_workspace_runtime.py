@@ -289,6 +289,97 @@ def _validate_ipynb(text: str) -> None:
             raise _ProfileFormatError("WORKSPACE_FORMAT_IPYNB_INVALID")
 
 
+def _validate_epub(path: Path) -> None:
+    """EPUB OCF container: stored ``mimetype`` first, container.xml naming a parseable OPF."""
+
+    code = "WORKSPACE_FORMAT_EPUB_INVALID"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if archive.testzip() is not None:
+                raise _ProfileFormatError(code)
+            infos = archive.infolist()
+            if (
+                not infos
+                or infos[0].filename != "mimetype"
+                or infos[0].compress_type != zipfile.ZIP_STORED
+                or archive.read("mimetype").strip() != b"application/epub+zip"
+            ):
+                raise _ProfileFormatError(code)
+            container = ElementTree.fromstring(archive.read("META-INF/container.xml"))
+            rootfiles = [
+                str(element.get("full-path") or "")
+                for element in container.iter()
+                if str(element.tag).endswith("rootfile")
+            ]
+            names = set(archive.namelist())
+            if not rootfiles:
+                raise _ProfileFormatError(code)
+            for full_path in rootfiles[:8]:
+                if not full_path or full_path not in names:
+                    raise _ProfileFormatError(code)
+                ElementTree.fromstring(archive.read(full_path))
+    except _ProfileFormatError:
+        raise
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError, KeyError, UnicodeError) as exc:
+        raise _ProfileFormatError(code) from exc
+
+
+def _validate_pdf(payload: bytes) -> None:
+    """PDF: version header, trailing %%EOF, and at least one page object (or object stream)."""
+
+    code = "WORKSPACE_FORMAT_PDF_INVALID"
+    if len(payload) < 32 or not (payload.startswith(b"%PDF-1.") or payload.startswith(b"%PDF-2.")):
+        raise _ProfileFormatError(code)
+    if b"%%EOF" not in payload[-2048:]:
+        raise _ProfileFormatError(code)
+    if b"/Page" not in payload and b"/ObjStm" not in payload:
+        raise _ProfileFormatError(code)
+
+
+_GEOJSON_GEOMETRY_TYPES = frozenset(
+    {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
+)
+
+
+def _geojson_geometry_ok(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("type")
+    if kind == "GeometryCollection":
+        members = value.get("geometries")
+        return isinstance(members, list) and all(_geojson_geometry_ok(item) for item in members[:10000])
+    return kind in _GEOJSON_GEOMETRY_TYPES and isinstance(value.get("coordinates"), list)
+
+
+def _geojson_feature_ok(value: object) -> bool:
+    if not isinstance(value, dict) or value.get("type") != "Feature":
+        return False
+    geometry = value.get("geometry")
+    properties = value.get("properties")
+    return (geometry is None or _geojson_geometry_ok(geometry)) and (
+        properties is None or isinstance(properties, dict)
+    )
+
+
+def _validate_geojson(text: str) -> None:
+    """GeoJSON (RFC 7946): a FeatureCollection, a Feature or a geometry object."""
+
+    code = "WORKSPACE_FORMAT_GEOJSON_INVALID"
+    document = json.loads(text)
+    if not isinstance(document, dict):
+        raise _ProfileFormatError(code)
+    kind = document.get("type")
+    if kind == "FeatureCollection":
+        features = document.get("features")
+        if not isinstance(features, list) or not all(_geojson_feature_ok(item) for item in features):
+            raise _ProfileFormatError(code)
+    elif kind == "Feature":
+        if not _geojson_feature_ok(document):
+            raise _ProfileFormatError(code)
+    elif not _geojson_geometry_ok(document):
+        raise _ProfileFormatError(code)
+
+
 def _validate_mo(payload: bytes) -> None:
     if len(payload) < 28:
         raise _ProfileFormatError("WORKSPACE_FORMAT_MO_INVALID")
@@ -458,6 +549,9 @@ STRUCTURE_PROFILE_CODES = {
     "ics_v1": "WORKSPACE_FORMAT_ICS_INVALID",
     "ipynb_v1": "WORKSPACE_FORMAT_IPYNB_INVALID",
     "mo_v1": "WORKSPACE_FORMAT_MO_INVALID",
+    "epub_v1": "WORKSPACE_FORMAT_EPUB_INVALID",
+    "pdf_v1": "WORKSPACE_FORMAT_PDF_INVALID",
+    "geojson_v1": "WORKSPACE_FORMAT_GEOJSON_INVALID",
 }
 
 
@@ -481,6 +575,10 @@ def profile_format_error(profile: str, path: Path, payload: bytes) -> str | None
             _validate_png(payload)
         elif profile == "mo_v1":
             _validate_mo(payload)
+        elif profile == "epub_v1":
+            _validate_epub(path)
+        elif profile == "pdf_v1":
+            _validate_pdf(payload)
         else:
             try:
                 text = payload.decode("utf-8")
@@ -488,6 +586,8 @@ def profile_format_error(profile: str, path: Path, payload: bytes) -> str | None
                 return code
             if profile == "ics_v1":
                 _validate_ics(text)
+            elif profile == "geojson_v1":
+                _validate_geojson(text)
             else:
                 _validate_ipynb(text)
     except _ProfileFormatError as exc:

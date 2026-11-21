@@ -26,11 +26,13 @@ from repoproof.adoption.admission.support_policy import PolicyResult
 from repoproof.adoption.analysis.repository_analyzer import RepositoryReport
 from repoproof.adoption.delivery.product_profile import (
     CLI_V2_PROFILE_ID,
+    OPEN_API_WORKSPACE_PROFILE_ID,
     WORKSPACE_BUNDLE_PROFILE_ID,
     DeliveryRequirements,
     ProductProfileError,
     product_delivery_profile,
 )
+from repoproof.domain.models import is_workspace_profile
 
 SCHEMA_VERSION = 1
 DELIVERY_PROFILE = CLI_V2_PROFILE_ID
@@ -333,14 +335,19 @@ def build_capability_plan_v2(
 
     base = build_capability_plan(root, report, policy, goal=goal)
     output_kinds = {item.kind for item in requirements.outputs}
+    workspace_profile_id = (
+        OPEN_API_WORKSPACE_PROFILE_ID
+        if requirements.network == "open_api"
+        else WORKSPACE_BUNDLE_PROFILE_ID
+    )
     if output_kinds == {"directory"}:
-        profile_id = WORKSPACE_BUNDLE_PROFILE_ID
+        profile_id = workspace_profile_id
         shape: AdaptationShape = "WORKSPACE_COMPOSITION"
     elif output_kinds == {"text_artifact"}:
         profile_id = CLI_V2_PROFILE_ID
         shape = "SINGLE_ARTIFACT"
     else:
-        profile_id = WORKSPACE_BUNDLE_PROFILE_ID
+        profile_id = workspace_profile_id
         shape = "WORKSPACE_COMPOSITION"
 
     delivery_codes: list[str] = []
@@ -359,11 +366,11 @@ def build_capability_plan_v2(
     if delivery_codes:
         support_status = "UNSUPPORTED"
         implementation_route = "NONE"
-    elif profile_id == WORKSPACE_BUNDLE_PROFILE_ID and support_status == "SUPPORTED":
+    elif is_workspace_profile(profile_id) and support_status == "SUPPORTED":
         implementation_route = "AGENT_ADAPT"
 
     confirmations = list(base.human_confirmations)
-    if profile_id == WORKSPACE_BUNDLE_PROFILE_ID:
+    if is_workspace_profile(profile_id):
         confirmations.extend([
             "workspace structure contract",
             "workspace semantic commitments",
